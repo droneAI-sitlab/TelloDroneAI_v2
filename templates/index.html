@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TelloAI Dashboard</title>
+
+    <!-- ── Stylesheet ─────────────────────────────────────────────── -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}" />
+
+    <!-- ── Font Awesome icons (CDN) ──────────────────────────────── -->
+    <link
+        rel="stylesheet"
+        href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"
+        crossorigin="anonymous"
+        referrerpolicy="no-referrer"
+    />
+</head>
+
+<body>
+
+<!-- ================================================================
+     APP CONTAINER  –  full-height flex row
+================================================================ -->
+<div class="app-container">
+
+
+    <!-- ============================================================
+         LEFT PANEL  –  video area (proportions 3:4 of horizontal)
+    ============================================================ -->
+    <section class="left-panel">
+
+
+        <!-- ── Battery indicator ──────────────────────────────── -->
+        <div class="battery-bar" title="Livello batteria drone">
+
+            <i class="fas fa-battery-full battery-bar__icon" id="battery-icon"></i>
+
+            <span class="battery-bar__label">Batteria</span>
+
+            <!-- Progress track -->
+            <div class="battery-bar__track">
+                <div class="battery-bar__fill" id="battery-fill"></div>
+            </div>
+
+            <span class="battery-bar__percent" id="battery-percent">— %</span>
+
+        </div>
+        <!-- /battery-bar -->
+
+
+        <!-- ── Video window ───────────────────────────────────── -->
+        <div class="video-window" id="video-window">
+
+            <!-- Shown when stream is inactive -->
+            <div class="video-window__placeholder" id="video-placeholder">
+                <i class="fas fa-video-slash"></i>
+                <span>Stream non attivo</span>
+            </div>
+
+            <!--
+                MJPEG stream consumed from Flask /video_feed.
+                Hidden until the stream toggle is switched ON.
+            -->
+            <img
+                id="video-feed"
+                src="{{ url_for('video_feed') }}"
+                alt="Video drone"
+                class="video-window__feed"
+                style="display:none;"
+            />
+
+        </div>
+        <!-- /video-window -->
+
+
+        <!-- ── Drone control toggles (row of vertical switches) ── -->
+        <div class="controls-bar">
+
+            <!-- WiFi toggle -->
+            <div class="toggle-item">
+                <span class="toggle-item__label">
+                    <i class="fas fa-wifi"></i> WiFi
+                </span>
+                <label class="toggle-switch">
+                    <input
+                        type="checkbox"
+                        id="wifi-toggle"
+                        onchange="toggleWifi(this)"
+                    />
+                    <span class="toggle-switch__slider"></span>
+                </label>
+                <span class="toggle-item__status" id="wifi-status">OFF</span>
+            </div>
+
+            <!-- Stream toggle -->
+            <div class="toggle-item">
+                <span class="toggle-item__label">
+                    <i class="fas fa-broadcast-tower"></i> Stream
+                </span>
+                <label class="toggle-switch">
+                    <input
+                        type="checkbox"
+                        id="stream-toggle"
+                        onchange="toggleStream(this)"
+                    />
+                    <span class="toggle-switch__slider"></span>
+                </label>
+                <span class="toggle-item__status" id="stream-status">OFF</span>
+            </div>
+
+        </div>
+        <!-- /controls-bar -->
+
+    </section>
+    <!-- /left-panel -->
+
+
+    <!-- ============================================================
+         RIGHT PANEL  –  log & input (1/4 of horizontal)
+    ============================================================ -->
+    <aside class="right-panel">
+
+        <!-- ── Panel header ───────────────────────────────────── -->
+        <header class="right-panel__header">
+            <i class="fas fa-terminal"></i>
+            <span>System Log</span>
+            <!-- Small "clear" button -->
+            <button class="clear-btn" onclick="clearLogs()" title="Svuota log">
+                <i class="fas fa-trash-alt"></i>
+            </button>
+        </header>
+
+        <!-- ── Scrollable log box ─────────────────────────────── -->
+        <div class="log-box" id="log-box">
+            <!-- Entries injected by JS -->
+            <div class="log-entry log-system">
+                <span class="log-time">[--:--:--]</span>
+                <span class="log-msg">TelloAI Dashboard pronto</span>
+            </div>
+        </div>
+
+        <!-- ── Text input area ────────────────────────────────── -->
+        <div class="input-area">
+
+            <!-- Row: text field + mic button -->
+            <div class="input-area__row">
+                <input
+                    type="text"
+                    id="message-input"
+                    class="input-area__field"
+                    placeholder="Scrivi un comando o un messaggio…"
+                    onkeydown="handleInputKey(event)"
+                    autocomplete="off"
+                />
+                <!-- Round microphone button -->
+                <button
+                    class="btn-mic"
+                    id="mic-btn"
+                    onclick="toggleMic()"
+                    title="Inserimento vocale"
+                    aria-label="Attiva microfono"
+                >
+                    <i class="fas fa-microphone"></i>
+                </button>
+            </div>
+
+            <!-- Send button -->
+            <button class="btn-send" onclick="sendMessage()">
+                <i class="fas fa-paper-plane"></i> Invia
+            </button>
+
+        </div>
+        <!-- /input-area -->
+
+    </aside>
+    <!-- /right-panel -->
+
+
+</div>
+<!-- /app-container -->
+
+<!-- ── Frontend logic ─────────────────────────────────────────────── -->
+<script src="{{ url_for('static', filename='js/main.js') }}"></script>
+
+</body>
+</html>
