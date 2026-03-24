@@ -88,6 +88,7 @@ app_state: dict = {
     "stream_active":  False,
     "battery":        0,       # 0-100 %
     "logs":           [],
+    "fps":            0.0,     # FPS in tempo reale
 }
 
 
@@ -420,6 +421,16 @@ def get_battery():
         return jsonify({"battery": app_state["battery"]})
 
 
+@app.route("/api/fps")
+def get_fps():
+    """
+    Return the current video stream FPS.
+    Returns JSON: {fps: float}
+    """
+    with _state_lock:
+        return jsonify({"fps": round(app_state["fps"], 1)})
+
+
 ########################################################################
 #  ROUTE – MJPEG video stream
 ########################################################################
@@ -438,13 +449,14 @@ def video_feed():
 
 def _frame_generator():
     """
-    Generatore MJPEG: lettura frame → elaborazione → overlay FPS → encode JPEG.
-    Segue il pattern di riferimento: timing preciso + fallback visivo su errore.
+    Generatore MJPEG: lettura frame → elaborazione → yield JPEG.
+    Calcolo FPS basato SOLO sui frame effettivamente inviati al client.
     """
     min_interval = 1.0 / TARGET_FPS
     last_sent = time.perf_counter()
-    fps = 0.0
     last_ocr_result_id = 0
+    frames_sent = 0
+    last_fps_update = time.perf_counter()
 
     while True:
         try:
@@ -495,22 +507,14 @@ def _frame_generator():
 
                     last_ocr_result_id = current_result_id
 
-            # ── Regolazione FPS ───────────────────────────────────────────
+            # ── Regolazione timing prima di encode/yield ─────────────────────
             now = time.perf_counter()
             delta = now - last_sent
             if delta < min_interval:
                 time.sleep(min_interval - delta)
                 now = time.perf_counter()
-                delta = now - last_sent
-
-            fps = 0.9 * fps + 0.1 * (1.0 / max(delta, 1e-6))
+            
             last_sent = now
-
-            # ── Overlay FPS + sorgente ────────────────────────────────────
-            cv2.putText(processed, f"FPS {int(fps)}", (12, 22),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (52, 211, 153), 2, cv2.LINE_AA)
-            cv2.putText(processed, "TELLO", (12, 46),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (52, 211, 153), 2, cv2.LINE_AA)
 
             # ── Encode JPEG e yield ───────────────────────────────────────
             ok, buffer = cv2.imencode(".jpg", processed,
@@ -518,12 +522,24 @@ def _frame_generator():
             if not ok:
                 continue
 
+            # ── YIELD: invia frame al client ──────────────────────────────
             yield (
                 b"--frame\r\n"
                 b"Content-Type: image/jpeg\r\n\r\n"
                 + buffer.tobytes() +
                 b"\r\n"
             )
+            
+            # ── Conteggio FPS: solo frame effettivamente inviati ──────────
+            frames_sent += 1
+            time_elapsed = now - last_fps_update
+            if time_elapsed >= 1.0:
+                fps = frames_sent / time_elapsed
+                frames_sent = 0
+                last_fps_update = now
+                # Aggiorna lo stato globale con l'FPS attuale
+                with _state_lock:
+                    app_state["fps"] = fps
 
         except Exception:
             # ── Fallback visivo + riavvio stream ──────────────────────────
@@ -545,6 +561,144 @@ def _frame_generator():
             except Exception:
                 pass
             time.sleep(0.5)
+
+
+########################################################################
+#  ROUTES – Settings / Configuration  (GET/POST .env)
+########################################################################
+
+@app.route("/api/config", methods=["GET"])
+def get_config():
+    """
+    Read current .env configuration and return filterable variables with descriptions.
+    Returns JSON: {config: {...}, descriptions: {...}}
+    """
+    # Variables to exclude from UI
+    EXCLUDED_VARS = {
+        "FLASK_DEBUG",
+        "FLASK_HOST",
+        "FLASK_PORT",
+        "ENABLE_CONTRAST",
+        "FRAME_HEIGHT",
+        "FRAME_WIDTH",
+        "SECRET_KEY",
+        "OLLAMA_PING_TEXT",
+        "OLLAMA_TEMPERATURE",
+        "OCR_MIN_CONFIDENCE",
+    }
+    
+    # Descriptive text for each parameter
+    DESCRIPTIONS = {
+        "DRONE_IP": "Indirizzo IP del drone Tello sulla rete locale",
+        "DRONE_PORT": "Porta comando del drone (default: 8889)",
+        "VIDEO_PORT": "Porta per il flusso video del drone (default: 11111)",
+        "LOG_MAX_ENTRIES": "Numero massimo di entry nel log (0-100)",
+        "DRONE_WIFI_SSID": "Nome della rete WiFi del drone (es. TELLO-XXXXXX)",
+        "WIFI_CONNECT_TIMEOUT": "Timeout connessione WiFi in secondi (15 = default)",
+        "JPEG_QUALITY": "Qualità JPEG per i frame (0-100, default: 80)",
+        "TARGET_FPS": "Frame rate target della dashboard (es. 30.0)",
+        "CONTRAST_ALPHA": "Fattore contrasto immagine (default: 1.05)",
+        "CONTRAST_BETA": "Offset contrasto immagine (default: 2)",
+        "OCR_ENABLED": "Abilita invio frame a server OCR remoto",
+        "OCR_SERVER_URL": "URL base del server RestOCR (es. https://ocr.sitai.duckdns.org)",
+        "OCR_TIMEOUT": "Timeout richiesta OCR in secondi (default: 30)",
+        "OCR_INTERVAL_SECONDS": "Intervallo minimo tra invii OCR in secondi (min: 1.0)",
+        "OCR_JPEG_QUALITY": "Qualità JPEG per frame inviati a OCR (0-100)",
+        "OLLAMA_URL": "Indirizzo del server Ollama (es. http://192.168.103.53:11434)",
+        "OLLAMA_MODEL": "Nome del modello Ollama principale",
+        "OLLAMA_FUNCTIONGEMMA_MODEL": "Nome del modello FunctionGemma in Ollama",
+        "OLLAMA_TIMEOUT": "Timeout richieste Ollama in secondi (default: 30)",
+        "COMMAND_BUFFER_DELAY_SECONDS": "Delay tra comandi eseguiti dal buffer (default: 2.0)",
+        "COMMAND_BUFFER_MAX_SIZE": "Dimensione massima coda comandi (default: 50)",
+    }
+    
+    config = {}
+    env_file_path = ".env"
+    
+    # Read .env file and parse it
+    if os.path.exists(env_file_path):
+        with open(env_file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                # Skip empty lines and comments
+                if not line or line.startswith('#'):
+                    continue
+                # Parse KEY=VALUE
+                if '=' in line:
+                    key, value = line.split('=', 1)
+                    key_clean = key.strip()
+                    
+                    # Only include non-excluded variables
+                    if key_clean not in EXCLUDED_VARS:
+                        config[key_clean] = value.strip()
+    
+    return jsonify({
+        "config": config,
+        "descriptions": DESCRIPTIONS
+    })
+
+
+@app.route("/api/config", methods=["POST"])
+def save_config():
+    """
+    Save configuration changes back to .env file.
+    Body JSON: {config: {KEY: VALUE, ...}}
+    Returns JSON: {success, message}
+    """
+    data = request.get_json(silent=True) or {}
+    new_config = data.get("config", {})
+    
+    if not isinstance(new_config, dict):
+        return jsonify({"success": False, "message": "Campo 'config' deve essere un dizionario"})
+    
+    env_file_path = ".env"
+    
+    try:
+        # Read existing .env file to preserve comments and order
+        lines = []
+        if os.path.exists(env_file_path):
+            with open(env_file_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+        
+        # Create a new content preserving comments and structure
+        new_lines = []
+        processed_keys = set()
+        
+        for line in lines:
+            stripped = line.strip()
+            
+            # Keep blank lines and comments as-is
+            if not stripped or stripped.startswith('#'):
+                new_lines.append(line)
+            elif '=' in stripped:
+                key = stripped.split('=', 1)[0].strip()
+                if key in new_config:
+                    # Replace with new value
+                    new_lines.append(f"{key}={new_config[key]}\n")
+                    processed_keys.add(key)
+                else:
+                    # Keep existing line
+                    new_lines.append(line)
+        
+        # Add any new keys that were not in the original file
+        for key, value in new_config.items():
+            if key not in processed_keys:
+                new_lines.append(f"{key}={value}\n")
+        
+        # Write back to .env
+        with open(env_file_path, 'w', encoding='utf-8') as f:
+            f.writelines(new_lines)
+        
+        add_log("Configurazione salvata in .env", "success")
+        return jsonify({
+            "success": True,
+            "message": "Configurazione salvata. Nota: ricarica la pagina per applicare le modifiche."
+        })
+    
+    except Exception as exc:
+        error_msg = f"Errore salvataggio config: {str(exc)}"
+        add_log(error_msg, "error")
+        return jsonify({"success": False, "message": error_msg})
 
 
 ########################################################################

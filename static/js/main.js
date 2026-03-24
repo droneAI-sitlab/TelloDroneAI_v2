@@ -41,10 +41,12 @@ document.addEventListener("DOMContentLoaded", () => {
  * Start two polling loops:
  *   - status every 2 s  (battery, toggle states)
  *   - logs   every 1 s  (new log entries)
+ *   - fps    every 0.5s (stream FPS)
  */
 function _startPolling() {
     setInterval(_fetchStatus, 2000);
     setInterval(_fetchLogs,   1000);
+    setInterval(_fetchFps,    500);
 }
 
 async function _fetchStatus() {
@@ -64,6 +66,19 @@ async function _fetchLogs() {
         const res  = await fetch("/api/logs");
         const data = await res.json();
         _renderLogs(data.logs);
+    } catch {
+        // Silent fail
+    }
+}
+
+async function _fetchFps() {
+    try {
+        const res  = await fetch("/api/fps");
+        const data = await res.json();
+        const fpsDisplay = document.getElementById("fps-display");
+        if (fpsDisplay) {
+            fpsDisplay.textContent = data.fps;
+        }
     } catch {
         // Silent fail
     }
@@ -369,3 +384,189 @@ async function _apiPost(url) {
         return null;
     }
 }
+
+
+// ================================================================
+//  SETTINGS MODAL  –  configuration management
+// ================================================================
+
+/**
+ * Open the settings modal and load the current .env configuration.
+ */
+async function openSettingsModal() {
+    const modal = document.getElementById("settings-modal");
+    const container = document.getElementById("settings-form-container");
+    
+    // Show modal with loading state
+    modal.style.display = "flex";
+    container.innerHTML = '<div class="loading-spinner"><i class="fas fa-spinner fa-spin"></i> Caricamento impostazioni…</div>';
+    
+    try {
+        const res = await fetch("/api/config");
+        const data = await res.json();
+        const config = data.config || {};
+        const descriptions = data.descriptions || {};
+        
+        // Build form with all config variables
+        container.innerHTML = "";
+        
+        const sortedKeys = Object.keys(config).sort();
+        sortedKeys.forEach(key => {
+            const group = document.createElement("div");
+            group.className = "settings-form-group";
+            
+            const label = document.createElement("label");
+            label.className = "settings-form-label";
+            label.title = descriptions[key] || ""; // Tooltip con descrizione
+            
+            const labelText = document.createElement("span");
+            labelText.textContent = key;
+            label.appendChild(labelText);
+            
+            // Add help icon if description exists
+            if (descriptions[key]) {
+                const helpIcon = document.createElement("i");
+                helpIcon.className = "fas fa-info-circle settings-help-icon";
+                helpIcon.title = descriptions[key];
+                label.appendChild(helpIcon);
+            }
+            
+            const input = document.createElement("input");
+            input.type = "text";
+            input.className = "settings-form-input";
+            input.id = `config-${key}`;
+            input.value = config[key];
+            input.placeholder = `Valore per ${key}`;
+            input.title = descriptions[key] || ""; // Tooltip sull'input
+            
+            // Add data attributes for validation
+            input.dataset.configKey = key;
+            
+            // Add validation event listeners
+            input.addEventListener("change", (e) => _validateConfigField(e.target, descriptions[key]));
+            
+            group.appendChild(label);
+            group.appendChild(input);
+            container.appendChild(group);
+        });
+        
+        addLocalLog("info", "Impostazioni caricate");
+    } catch (err) {
+        container.innerHTML = `<div style="color: #c62828; padding: 20px;">Errore caricamento configurazione: ${err.message}</div>`;
+        addLocalLog("error", "Errore caricamento impostazioni: " + err.message);
+    }
+}
+
+/**
+ * Validate a single configuration field based on business rules.
+ * @param {HTMLInputElement} input
+ * @param {string} description
+ */
+function _validateConfigField(input, description) {
+    const key = input.dataset.configKey;
+    const value = input.value.trim();
+    
+    // Remove previous error state
+    input.classList.remove("settings-form-input--error");
+    
+    // LOG_MAX_ENTRIES: between 0 and 100
+    if (key === "LOG_MAX_ENTRIES") {
+        const num = parseInt(value, 10);
+        if (isNaN(num) || num < 0 || num > 100) {
+            input.classList.add("settings-form-input--error");
+            input.title = "❌ Deve essere un numero tra 0 e 100";
+            return false;
+        }
+        input.title = description || "";
+    }
+    
+    // OCR_INTERVAL_SECONDS: minimum 1 second
+    if (key === "OCR_INTERVAL_SECONDS") {
+        const num = parseFloat(value);
+        if (isNaN(num) || num < 1.0) {
+            input.classList.add("settings-form-input--error");
+            input.title = "❌ Deve essere minimo 1.0 secondo";
+            return false;
+        }
+        input.title = description || "";
+    }
+    
+    return true;
+}
+
+/**
+ * Close the settings modal.
+ */
+function closeSettingsModal() {
+    const modal = document.getElementById("settings-modal");
+    modal.style.display = "none";
+}
+
+/**
+ * Save the settings form and update .env file.
+ */
+async function saveSettings() {
+    const modal = document.getElementById("settings-modal");
+    const container = document.getElementById("settings-form-container");
+    
+    // Validate all fields before saving
+    const inputs = container.querySelectorAll(".settings-form-input");
+    let hasErrors = false;
+    
+    inputs.forEach(input => {
+        if (!_validateConfigField(input, input.title)) {
+            hasErrors = true;
+        }
+    });
+    
+    if (hasErrors) {
+        addLocalLog("error", "❌ Correggi gli errori di validazione (campi rossi)");
+        return;
+    }
+    
+    // Collect all form input values
+    const config = {};
+    inputs.forEach(input => {
+        const key = input.id.replace("config-", "");
+        config[key] = input.value;
+    });
+    
+    try {
+        const res = await fetch("/api/config", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ config }),
+        });
+        const data = await res.json();
+        
+        if (data.success) {
+            addLocalLog("success", "✅ Configurazione salvata con successo!");
+            
+            // Ask user if they want to reload
+            if (confirm("Impostazioni salvate. Vuoi ricaricare la pagina per applicare le modifiche?")) {
+                location.reload();
+            } else {
+                closeSettingsModal();
+            }
+        } else {
+            addLocalLog("error", data.message || "Errore salvataggio configurazione");
+        }
+    } catch (err) {
+        addLocalLog("error", "Errore salvataggio impostazioni: " + err.message);
+    }
+}
+
+/**
+ * Close modal when clicking the overlay.
+ */
+document.addEventListener("DOMContentLoaded", () => {
+    const modal = document.getElementById("settings-modal");
+    if (modal) {
+        modal.addEventListener("click", (event) => {
+            // Only close if clicking the overlay itself, not the content
+            if (event.target === modal.querySelector(".settings-modal__overlay")) {
+                closeSettingsModal();
+            }
+        });
+    }
+});
