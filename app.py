@@ -238,8 +238,8 @@ def toggle_wifi():
         currently_on = app_state["wifi_connected"]
 
     if currently_on:
-        # ── Disconnetti: ferma stream e drone, poi WiFi ──────────────────
-        drone_reader.disconnect()
+        # ── Disconnetti: cleanup completo, poi WiFi ──────────────────
+        drone_reader.cleanup_connection()
         with _state_lock:
             app_state["wifi_connected"] = False
             app_state["stream_active"]  = False
@@ -279,11 +279,11 @@ def toggle_stream():
         currently_on = app_state["stream_active"]
 
     if currently_on:
-        # ── Ferma stream ──────────────────────────────────────────────
-        drone_reader.stop_stream()
+        # ── Ferma stream con cleanup completo ──────────────────────────
+        drone_reader.cleanup_connection()
         with _state_lock:
             app_state["stream_active"] = False
-        add_log("Stream fermato", "warning")
+        add_log("Stream fermato e connessione liberata", "warning")
         return jsonify({"success": True, "active": False, "message": "Stream fermato"})
 
     # ── Connetti al drone e avvia stream in un’unica operazione ──────────
@@ -697,6 +697,31 @@ def save_config():
     
     except Exception as exc:
         error_msg = f"Errore salvataggio config: {str(exc)}"
+        add_log(error_msg, "error")
+        return jsonify({"success": False, "message": error_msg})
+
+
+########################################################################
+#  ROUTES – Emergency cleanup  (sicurezza connessioni dangling)
+########################################################################
+
+@app.route("/api/cleanup", methods=["POST"])
+def cleanup():
+    """
+    Cleanup d'emergenza: chiude la connessione TCP al drone, fermando lo stream.
+    Usato per liberare il drone da connessioni dangling.
+    Chiamato all'avvio della pagina e quando si disattiva lo stream/WiFi.
+    Returns JSON: {success, message}
+    """
+    try:
+        drone_reader.cleanup_connection()
+        with _state_lock:
+            app_state["stream_active"] = False
+            app_state["battery"]        = 0
+        add_log("Cleanup connessioni drone completato", "system")
+        return jsonify({"success": True, "message": "Drone disconnesso e liberato"})
+    except Exception as exc:
+        error_msg = f"Errore cleanup: {str(exc)}"
         add_log(error_msg, "error")
         return jsonify({"success": False, "message": error_msg})
 

@@ -170,6 +170,23 @@ class DroneReader:
 
         print("[frame_reader] Stream fermato")
 
+    def cleanup_connection(self) -> None:
+        """
+        Cleanup aggressivo: ferma stream e chiude la connessione TCP al drone.
+        Deve essere chiamato prima di tentare una nuova connessione.
+        Libera il drone da connessioni dangling.
+        """
+        self.stop_stream()
+
+        if self._tello is not None:
+            try:
+                self._tello.end()
+                print("[frame_reader] Connessione TCP al drone chiusa")
+            except Exception as exc:
+                print(f"[frame_reader] Errore durante end(): {exc}")
+            finally:
+                self._tello = None
+
     # ----------------------------------------------------------------
     #  DISCONNECT
     # ----------------------------------------------------------------

@@ -27,10 +27,33 @@ const ui = {
 //  INITIALISATION  –  runs after DOM is fully loaded
 // ================================================================
 
-document.addEventListener("DOMContentLoaded", () => {
+document.addEventListener("DOMContentLoaded", async () => {
+    // Pulizia d'emergenza all'avvio: chiudi eventuali connessioni dangling al drone
+    await _performCleanup();
+    
     _startPolling();
     addLocalLog("system", "Dashboard connessa");
 });
+
+
+/**
+ * Cleanup d'emergenza: chiama l'endpoint /api/cleanup per liberare
+ * il drone da eventuali connessioni dangling della sessione precedente.
+ */
+async function _performCleanup() {
+    try {
+        const res = await fetch("/api/cleanup", { method: "POST" });
+        if (res.ok) {
+            const data = await res.json();
+            if (data.success) {
+                console.log("[cleanup] Drone liberato");
+            }
+        }
+    } catch (err) {
+        // Errore non critico: il drone potrebbe non essere connesso
+        console.warn("[cleanup] Errore durante cleanup avvio:", err);
+    }
+}
 
 
 // ================================================================
