@@ -24,9 +24,11 @@
 """
 
 import re
+import threading
 from typing import Optional, Tuple
 
 from drone.frame_reader import DroneReader
+from drone.media_capture import DroneMediaCapture
 
 
 ########################################################################
@@ -163,6 +165,40 @@ COMMAND_TABLE: dict = {
         "unit":    "cm/s",
         "desc":    "Imposta velocità massima",
     },
+
+    # ── Telemetria / keepalive ───────────────────────────────────────
+    "send_keepalive": {
+        "fn":      lambda t, _: t.send_keepalive(),
+        "default": None,
+        "unit":    "",
+        "desc":    "Invia heartbeat per mantenere la sessione attiva",
+    },
+    "get_battery": {
+        "fn":      lambda t, _: t.get_battery(),
+        "default": None,
+        "unit":    "%",
+        "desc":    "Legge la batteria del drone",
+    },
+
+    # ── Media capture ────────────────────────────────────────────────
+    "take_photo": {
+        "fn":      lambda t, _: None,
+        "default": None,
+        "unit":    "",
+        "desc":    "Scatta una foto dalla camera del drone",
+    },
+    "start_video_recording": {
+        "fn":      lambda t, _: None,
+        "default": None,
+        "unit":    "",
+        "desc":    "Avvia registrazione video dalla camera del drone",
+    },
+    "stop_video_recording": {
+        "fn":      lambda t, _: None,
+        "default": None,
+        "unit":    "",
+        "desc":    "Ferma registrazione video e salva il file",
+    },
 }
 
 # ── Alias: parole italiane / inglesi alternative → nome canonico ──────
@@ -192,6 +228,15 @@ _ALIASES: dict = {
     "up":             "move_up",
     "down":           "move_down",
     "stop":           "emergency",
+    "keepalive":      "send_keepalive",
+    "battery":        "get_battery",
+    "foto":           "take_photo",
+    "photo":          "take_photo",
+    "scatta_foto":    "take_photo",
+    "avvia_video":    "start_video_recording",
+    "start_video":    "start_video_recording",
+    "stop_video":     "stop_video_recording",
+    "ferma_video":    "stop_video_recording",
 }
 
 
@@ -213,12 +258,20 @@ class CommandExecutor:
         ok, msg  = executor.run("move_forward")    # usa default 30 cm
     """
 
-    def __init__(self, drone_reader: DroneReader) -> None:
+    def __init__(
+        self,
+        drone_reader: DroneReader,
+        media_capture: Optional[DroneMediaCapture] = None,
+    ) -> None:
         """
         Args:
             drone_reader: istanza DroneReader già avviata (stream attivo)
+            media_capture: manager opzionale per foto/registrazione video
         """
         self._reader = drone_reader
+        self._media_capture = media_capture
+        self._state_lock = threading.Lock()
+        self._is_flying = False
         print("[command_executor] Inizializzato")
 
     # ----------------------------------------------------------------
@@ -251,6 +304,9 @@ class CommandExecutor:
 
         entry = COMMAND_TABLE[canonical]
 
+        if canonical in {"take_photo", "start_video_recording", "stop_video_recording"}:
+            return self._run_media_command(canonical)
+
         # ── 2. Verifica connessione ────────────────────────────────────
         tello = self._reader.get_tello()
         if tello is None:
@@ -264,18 +320,60 @@ class CommandExecutor:
 
         # ── 4. Esecuzione lambda dalla tabella ─────────────────────────
         try:
-            entry["fn"](tello, effective_arg)
+            fn_result = entry["fn"](tello, effective_arg)
         except Exception as exc:
             msg = f"Errore SDK su '{canonical}': {exc}"
             print(f"[command_executor] {msg}")
             return False, msg
 
+        if canonical == "takeoff":
+            with self._state_lock:
+                self._is_flying = True
+        elif canonical in {"land", "emergency"}:
+            with self._state_lock:
+                self._is_flying = False
+
         # ── 5. Log e risposta ──────────────────────────────────────────
         unit   = entry["unit"]
-        detail = f"{effective_arg}{unit}" if effective_arg is not None else ""
+        if effective_arg is not None:
+            detail = f"{effective_arg}{unit}"
+        elif fn_result is not None:
+            detail = f"{fn_result}{unit}"
+        else:
+            detail = ""
         log    = f"[command_executor] {canonical} {detail}".strip()
         print(log)
         return True, f"ok – {canonical} {detail}".strip()
+
+    def _run_media_command(self, canonical: str) -> Tuple[bool, str]:
+        """Esegue i comandi media tramite DroneMediaCapture."""
+        if self._media_capture is None:
+            return False, "Media capture non configurato"
+
+        try:
+            if canonical == "take_photo":
+                path = self._media_capture.take_photo()
+                return True, f"ok – take_photo {path}"
+
+            if canonical == "start_video_recording":
+                path = self._media_capture.start_video_recording()
+                return True, f"ok – start_video_recording {path}"
+
+            path = self._media_capture.stop_video_recording()
+            return True, f"ok – stop_video_recording {path}"
+
+        except Exception as exc:
+            return False, f"Errore media su '{canonical}': {exc}"
+
+    def is_flying(self) -> bool:
+        """Ritorna True se lo stato interno indica drone in volo."""
+        with self._state_lock:
+            return self._is_flying
+
+    def reset_flight_state(self) -> None:
+        """Reset esplicito da usare dopo cleanup/disconnessioni."""
+        with self._state_lock:
+            self._is_flying = False
 
     def run_from_text(self, text: str) -> Tuple[bool, str]:
         """

@@ -9,6 +9,7 @@ import datetime
 import threading
 import time
 import queue
+import re
 
 import cv2
 import numpy as np
@@ -20,6 +21,7 @@ from drone import wifi
 from drone.frame_reader import DroneReader
 from drone.frame_processor import FrameProcessor
 from drone.ocr_sender import OCRSender
+from drone.media_capture import DroneMediaCapture
 from drone.ollama_client import (
     call_ollama_from_ocr_words,
     call_functiongemma_from_text,
@@ -69,6 +71,12 @@ OCR_ENABLED = os.getenv("OCR_ENABLED", "True") == "True"
 # ── Buffer comandi da FunctionGemma ───────────────────────────────────
 COMMAND_BUFFER_DELAY_SECONDS = float(os.getenv("COMMAND_BUFFER_DELAY_SECONDS", "2.0"))
 COMMAND_BUFFER_MAX_SIZE = int(os.getenv("COMMAND_BUFFER_MAX_SIZE", "50"))
+PERMANENT_BUFFER_PAUSE_SECONDS = float(os.getenv("PERMANENT_BUFFER_PAUSE_SECONDS", "5.0"))
+ALWAYS_KEEPALIVE_INTERVAL_SECONDS = float(os.getenv("ALWAYS_KEEPALIVE_INTERVAL_SECONDS", "8.0"))
+META_PAUSE_COMMAND = "*pausa"
+MEDIA_OUTPUT_DIR = os.getenv("MEDIA_OUTPUT_DIR", "captures")
+MEDIA_VIDEO_FPS = float(os.getenv("MEDIA_VIDEO_FPS", "20.0"))
+MEDIA_VIDEO_CODEC = os.getenv("MEDIA_VIDEO_CODEC", "mp4v")
 
 # ── Colori terminale (ANSI) ───────────────────────────────────────────
 ANSI_RESET  = "\033[0m"
@@ -132,12 +140,21 @@ frame_processor = FrameProcessor(
 # (la config completa è in .env, letta internamente da OCRSender)
 ocr_sender = OCRSender()
 
+# DroneMediaCapture gestisce foto e registrazione video da stream drone
+media_capture = DroneMediaCapture(drone_reader)
+
 # CommandExecutor traduce nomi-comando → chiamate SDK djitellopy
-command_executor = CommandExecutor(drone_reader)
+command_executor = CommandExecutor(drone_reader, media_capture=media_capture)
 
 
 # Coda FIFO: i comandi vengono eseguiti in sequenza con delay tra uno e il successivo
 command_buffer: queue.Queue[tuple[str, int | None]] = queue.Queue(maxsize=COMMAND_BUFFER_MAX_SIZE)
+
+# Buffer permanente: usato solo quando la coda temporanea e' vuota e il drone e' in volo
+PERMANENT_BUFFER_COMMANDS: list[tuple[str, int | None]] = [
+    ("send_keepalive", None),
+    (META_PAUSE_COMMAND, None),
+]
 
 
 def enqueue_executor_commands(commands: list[tuple[str, int | None]], source: str = "ocr") -> int:
@@ -159,6 +176,35 @@ def enqueue_executor_commands(commands: list[tuple[str, int | None]], source: st
     return enqueued
 
 
+def _enqueue_permanent_buffer_if_needed(trigger: str) -> int:
+    """
+    Accoda il buffer permanente solo quando:
+      - stream attivo
+      - drone in volo
+      - coda temporanea vuota
+    """
+    with _state_lock:
+        stream_on = app_state["stream_active"]
+
+    if not stream_on or not command_executor.is_flying() or not command_buffer.empty():
+        return 0
+
+    enqueued = 0
+    for command_name, argument in PERMANENT_BUFFER_COMMANDS:
+        try:
+            command_buffer.put_nowait((command_name, argument))
+            enqueued += 1
+        except queue.Full:
+            break
+
+    if enqueued > 0:
+        msg = f"Buffer permanente accodato ({trigger}): {enqueued}/{len(PERMANENT_BUFFER_COMMANDS)}"
+        print(f"{ANSI_BUFFER}[app] {msg}{ANSI_RESET}")
+        add_log(msg, "system")
+
+    return enqueued
+
+
 def _command_buffer_worker() -> None:
     """
     Worker dedicato: esegue comandi dalla coda con una pausa configurabile tra esecuzioni.
@@ -166,7 +212,33 @@ def _command_buffer_worker() -> None:
     while True:
         command_name, argument = command_buffer.get()
         try:
-            ok_cmd, msg_cmd = command_executor.run(command_name, argument)
+            if command_name == "send_keepalive":
+                ok_cmd, msg_cmd = command_executor.run(command_name, argument)
+                if not ok_cmd:
+                    # Fallback robusto: una query SDK mantiene viva la sessione anche
+                    # sui firmware che non rispondono al comando keepalive.
+                    ok_fallback, msg_fallback = command_executor.run("get_battery", None)
+                    if ok_fallback:
+                        battery_level = drone_reader.get_battery()
+                        with _state_lock:
+                            app_state["battery"] = battery_level
+                        ok_cmd = True
+                        msg_cmd = (
+                            f"keepalive non confermato ({msg_cmd}); "
+                            f"fallback ok: {msg_fallback}"
+                        )
+                        add_log("Keepalive non confermato: usato fallback get_battery", "warning")
+                    else:
+                        msg_cmd = f"{msg_cmd} | fallback get_battery fallito: {msg_fallback}"
+            elif command_name == META_PAUSE_COMMAND:
+                pause_seconds = max(0.0, PERMANENT_BUFFER_PAUSE_SECONDS)
+                if pause_seconds > 0:
+                    time.sleep(pause_seconds)
+                ok_cmd, msg_cmd = True, f"ok – {META_PAUSE_COMMAND} {pause_seconds:.1f}s"
+                _enqueue_permanent_buffer_if_needed("meta-pausa")
+            else:
+                ok_cmd, msg_cmd = command_executor.run(command_name, argument)
+
             if ok_cmd:
                 print(f"[app] Comando eseguito da buffer: {msg_cmd}")
                 add_log(f"Eseguito: {msg_cmd}", "success")
@@ -179,15 +251,60 @@ def _command_buffer_worker() -> None:
         finally:
             command_buffer.task_done()
 
-        # Delay tra un comando e il successivo
-        if COMMAND_BUFFER_DELAY_SECONDS > 0:
+        # Delay tra un comando e il successivo (la meta pausa gestisce gia il proprio wait)
+        if command_name != META_PAUSE_COMMAND and COMMAND_BUFFER_DELAY_SECONDS > 0:
             time.sleep(COMMAND_BUFFER_DELAY_SECONDS)
+
+        if command_name != META_PAUSE_COMMAND:
+            _enqueue_permanent_buffer_if_needed("worker-empty")
 
 
 threading.Thread(
     target=_command_buffer_worker,
     daemon=True,
     name="command-buffer-worker",
+).start()
+
+
+def _always_keepalive_loop() -> None:
+    """
+    Keepalive sempre attivo quando stream e connessione drone sono disponibili,
+    indipendente da chat, buffer temporaneo o buffer permanente.
+    """
+    interval = max(2.0, ALWAYS_KEEPALIVE_INTERVAL_SECONDS)
+    while True:
+        time.sleep(interval)
+
+        with _state_lock:
+            stream_on = app_state["stream_active"]
+        if not stream_on:
+            continue
+
+        ok_keepalive, msg_keepalive = command_executor.run("send_keepalive", None)
+        if ok_keepalive:
+            continue
+
+        # Fallback: su alcuni firmware una query batteria mantiene viva la sessione.
+        ok_battery, msg_battery = command_executor.run("get_battery", None)
+        if ok_battery:
+            level = drone_reader.get_battery()
+            with _state_lock:
+                app_state["battery"] = level
+            add_log(
+                "Keepalive periodico non confermato: fallback get_battery riuscito",
+                "warning",
+            )
+        else:
+            add_log(
+                f"Keepalive periodico fallito: {msg_keepalive} | fallback: {msg_battery}",
+                "error",
+            )
+
+
+threading.Thread(
+    target=_always_keepalive_loop,
+    daemon=True,
+    name="always-keepalive",
 ).start()
 
 
@@ -239,7 +356,9 @@ def toggle_wifi():
 
     if currently_on:
         # ── Disconnetti: cleanup completo, poi WiFi ──────────────────
+        media_capture.stop_video_recording_silent()
         drone_reader.cleanup_connection()
+        command_executor.reset_flight_state()
         with _state_lock:
             app_state["wifi_connected"] = False
             app_state["stream_active"]  = False
@@ -280,7 +399,9 @@ def toggle_stream():
 
     if currently_on:
         # ── Ferma stream con cleanup completo ──────────────────────────
+        media_capture.stop_video_recording_silent()
         drone_reader.cleanup_connection()
+        command_executor.reset_flight_state()
         with _state_lock:
             app_state["stream_active"] = False
         add_log("Stream fermato e connessione liberata", "warning")
@@ -338,6 +459,69 @@ def list_commands():
     return jsonify({"commands": command_executor.available_commands()})
 
 
+@app.route("/api/media/photo", methods=["POST"])
+def take_photo_route():
+    """
+    Scatta una foto dal feed corrente del drone.
+    Returns JSON: {success, message, path}
+    """
+    try:
+        path = media_capture.take_photo()
+        msg = f"Foto salvata: {path}"
+        add_log(msg, "success")
+        return jsonify({"success": True, "message": msg, "path": path})
+    except Exception as exc:
+        msg = f"Errore foto: {exc}"
+        add_log(msg, "error")
+        return jsonify({"success": False, "message": msg})
+
+
+@app.route("/api/media/video/start", methods=["POST"])
+def start_video_route():
+    """
+    Avvia registrazione video dal feed del drone.
+    Returns JSON: {success, message, path}
+    """
+    try:
+        path = media_capture.start_video_recording()
+        msg = f"Registrazione video avviata: {path}"
+        add_log(msg, "success")
+        return jsonify({"success": True, "message": msg, "path": path})
+    except Exception as exc:
+        msg = f"Errore avvio registrazione: {exc}"
+        add_log(msg, "error")
+        return jsonify({"success": False, "message": msg})
+
+
+@app.route("/api/media/video/stop", methods=["POST"])
+def stop_video_route():
+    """
+    Ferma registrazione video in corso.
+    Returns JSON: {success, message, path}
+    """
+    try:
+        path = media_capture.stop_video_recording()
+        msg = f"Registrazione video fermata: {path}"
+        add_log(msg, "success")
+        return jsonify({"success": True, "message": msg, "path": path})
+    except Exception as exc:
+        msg = f"Errore stop registrazione: {exc}"
+        add_log(msg, "error")
+        return jsonify({"success": False, "message": msg})
+
+
+@app.route("/api/media/status", methods=["GET"])
+def media_status_route():
+    """
+    Stato attuale del recorder video.
+    Returns JSON: {recording: bool, path: str | null}
+    """
+    return jsonify({
+        "recording": media_capture.is_recording(),
+        "path": media_capture.get_recording_path(),
+    })
+
+
 ########################################################################
 #  ROUTES – Messaging / commands
 ########################################################################
@@ -360,6 +544,30 @@ def send_message():
     # Stampa in terminale esattamente il testo ricevuto, senza alterarlo.
     print(f"{ANSI_CHAT}[chat] Messaggio ricevuto: {message}{ANSI_RESET}")
     add_log(f"Chat ricevuta: {message}", "user")
+
+    # Modalita temporanea: esegui SOLO comandi diretti supportati da CommandExecutor.
+    # Se il testo non rappresenta un comando noto, non fare nulla.
+    match = re.match(r"^(.*?)(?:\s+(-?\d+))?$", message_trimmed)
+    if match:
+        direct_command = match.group(1).strip()
+        direct_arg_raw = match.group(2)
+        direct_argument = int(direct_arg_raw) if direct_arg_raw is not None else None
+
+        ok_direct, msg_direct = command_executor.run(direct_command, direct_argument)
+        if ok_direct:
+            add_log(f"Comando diretto chat eseguito: {msg_direct}", "success")
+            return jsonify({"success": True, "message": msg_direct, "direct_command": True})
+
+        if "Comando sconosciuto" in msg_direct:
+            add_log("Nessun comando diretto riconosciuto (no-op)", "system")
+            return jsonify({
+                "success": True,
+                "message": "Nessun comando diretto riconosciuto",
+                "direct_command": False,
+            })
+
+        add_log(f"Errore comando diretto chat: {msg_direct}", "error")
+        return jsonify({"success": False, "message": msg_direct, "direct_command": True})
 
     ok_llm, llm_output = call_functiongemma_from_text(message)
     if not ok_llm:
@@ -610,6 +818,11 @@ def get_config():
         "OLLAMA_TIMEOUT": "Timeout richieste Ollama in secondi (default: 30)",
         "COMMAND_BUFFER_DELAY_SECONDS": "Delay tra comandi eseguiti dal buffer (default: 2.0)",
         "COMMAND_BUFFER_MAX_SIZE": "Dimensione massima coda comandi (default: 50)",
+        "PERMANENT_BUFFER_PAUSE_SECONDS": "Durata meta comando *pausa in secondi (default: 5.0)",
+        "ALWAYS_KEEPALIVE_INTERVAL_SECONDS": "Intervallo keepalive globale in secondi quando stream e' attivo (default: 8.0)",
+        "MEDIA_OUTPUT_DIR": "Directory dove salvare foto/video (default: captures)",
+        "MEDIA_VIDEO_FPS": "FPS di registrazione video (default: 20.0)",
+        "MEDIA_VIDEO_CODEC": "Codec FourCC video (default: mp4v)",
     }
     
     config = {}
@@ -714,7 +927,9 @@ def cleanup():
     Returns JSON: {success, message}
     """
     try:
+        media_capture.stop_video_recording_silent()
         drone_reader.cleanup_connection()
+        command_executor.reset_flight_state()
         with _state_lock:
             app_state["stream_active"] = False
             app_state["battery"]        = 0
