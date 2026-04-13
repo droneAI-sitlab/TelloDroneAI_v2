@@ -366,9 +366,45 @@ class CommandExecutor:
             return False, f"Errore media su '{canonical}': {exc}"
 
     def is_flying(self) -> bool:
-        """Ritorna True se lo stato interno indica drone in volo."""
+        """
+        Ritorna True se il drone e' effettivamente in volo.
+        
+        Verifica lo stato interno e, se possibile, interroga l'altezza reale
+        dal drone per rilevare auto-landing non comandato.
+        
+        Returns:
+            True se drone in volo, False se a terra o non connesso
+        """
         with self._state_lock:
-            return self._is_flying
+            internal_state = self._is_flying
+        
+        # Se lo stato interno dice "non in volo", non serve interrogare il drone
+        if not internal_state:
+            return False
+        
+        # Tenta di verificare con telemetria reale
+        tello = self._reader.get_tello()
+        if tello is None:
+            # Drone non connesso - fallback allo stato interno
+            return internal_state
+        
+        try:
+            # Query altezza dal drone (cm)
+            # Se altezza > 10cm, il drone e' probabilmente in volo
+            height = tello.get_height()
+            if height is not None and height > 10:
+                return True
+            elif height is not None and height <= 10:
+                # Drone a terra ma flag interno dice "flying" - auto-landing rilevato
+                # Aggiorna lo stato interno per consistenza
+                with self._state_lock:
+                    self._is_flying = False
+                return False
+        except Exception:
+            # Errore query telemetria - fallback allo stato interno
+            pass
+        
+        return internal_state
 
     def reset_flight_state(self) -> None:
         """Reset esplicito da usare dopo cleanup/disconnessioni."""

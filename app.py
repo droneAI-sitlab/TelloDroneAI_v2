@@ -68,11 +68,16 @@ TARGET_FPS            = float(os.getenv("TARGET_FPS",         30.0))
 # letta direttamente da .env all'interno di OCRSender tramite load_dotenv.
 OCR_ENABLED = os.getenv("OCR_ENABLED", "True") == "True"
 
+# ── FunctionGemma (interpretazione comandi chat) ───────────────────────
+# Se disabilitato, i comandi dalla chat devono essere scritti esattamente
+# (case-insensitive: "takeoff", "move_forward 50", "avanti 30")
+FUNCTIONGEMMA_ENABLED = os.getenv("FUNCTIONGEMMA_ENABLED", "True") == "True"
+
 # ── Buffer comandi da FunctionGemma ───────────────────────────────────
 COMMAND_BUFFER_DELAY_SECONDS = float(os.getenv("COMMAND_BUFFER_DELAY_SECONDS", "2.0"))
 COMMAND_BUFFER_MAX_SIZE = int(os.getenv("COMMAND_BUFFER_MAX_SIZE", "50"))
 PERMANENT_BUFFER_PAUSE_SECONDS = float(os.getenv("PERMANENT_BUFFER_PAUSE_SECONDS", "5.0"))
-ALWAYS_KEEPALIVE_INTERVAL_SECONDS = float(os.getenv("ALWAYS_KEEPALIVE_INTERVAL_SECONDS", "8.0"))
+ALWAYS_KEEPALIVE_INTERVAL_SECONDS = float(os.getenv("ALWAYS_KEEPALIVE_INTERVAL_SECONDS", "5.0"))
 META_PAUSE_COMMAND = "*pausa"
 MEDIA_OUTPUT_DIR = os.getenv("MEDIA_OUTPUT_DIR", "captures")
 MEDIA_VIDEO_FPS = float(os.getenv("MEDIA_VIDEO_FPS", "20.0"))
@@ -266,39 +271,64 @@ threading.Thread(
 ).start()
 
 
+# Numero massimo di fallimenti consecutivi prima di tentare riconnessione
+KEEPALIVE_MAX_FAILURES = 3
+
+
 def _always_keepalive_loop() -> None:
     """
     Keepalive sempre attivo quando stream e connessione drone sono disponibili,
     indipendente da chat, buffer temporaneo o buffer permanente.
+    Include logica di riconnessione automatica dopo fallimenti ripetuti.
     """
     interval = max(2.0, ALWAYS_KEEPALIVE_INTERVAL_SECONDS)
+    consecutive_failures = 0
+
     while True:
         time.sleep(interval)
 
         with _state_lock:
             stream_on = app_state["stream_active"]
         if not stream_on:
+            consecutive_failures = 0  # Reset se stream non attivo
             continue
 
         ok_keepalive, msg_keepalive = command_executor.run("send_keepalive", None)
         if ok_keepalive:
+            consecutive_failures = 0
             continue
 
-        # Fallback: su alcuni firmware una query batteria mantiene viva la sessione.
-        ok_battery, msg_battery = command_executor.run("get_battery", None)
-        if ok_battery:
-            level = drone_reader.get_battery()
-            with _state_lock:
-                app_state["battery"] = level
-            add_log(
-                "Keepalive periodico non confermato: fallback get_battery riuscito",
-                "warning",
-            )
-        else:
-            add_log(
-                f"Keepalive periodico fallito: {msg_keepalive} | fallback: {msg_battery}",
-                "error",
-            )
+        # Keepalive fallito - incrementa contatore
+        consecutive_failures += 1
+        add_log(f"Keepalive fallito ({consecutive_failures}/{KEEPALIVE_MAX_FAILURES}): {msg_keepalive}", "warning")
+
+        if consecutive_failures >= KEEPALIVE_MAX_FAILURES:
+            add_log(f"Keepalive fallito {consecutive_failures} volte consecutive - tentativo riconnessione", "error")
+            
+            # Tentativo di riconnessione
+            try:
+                media_capture.stop_video_recording_silent()
+                drone_reader.cleanup_connection()
+                time.sleep(1.0)
+                
+                ok_reconnect = drone_reader.start_stream()
+                if ok_reconnect:
+                    add_log("Riconnessione drone riuscita", "success")
+                    with _state_lock:
+                        app_state["battery"] = drone_reader.get_battery()
+                    consecutive_failures = 0
+                else:
+                    add_log("Riconnessione drone fallita - stream disattivato", "error")
+                    with _state_lock:
+                        app_state["stream_active"] = False
+                    command_executor.reset_flight_state()
+                    consecutive_failures = 0
+            except Exception as exc:
+                add_log(f"Errore durante riconnessione: {exc}", "error")
+                with _state_lock:
+                    app_state["stream_active"] = False
+                command_executor.reset_flight_state()
+                consecutive_failures = 0
 
 
 threading.Thread(
@@ -532,6 +562,9 @@ def send_message():
     Receive a text command or message from the UI.
     Body JSON: {message: str}
     Returns JSON: {success, message}
+    
+    Se FUNCTIONGEMMA_ENABLED=false: accetta solo comandi diretti (case-insensitive)
+    Se FUNCTIONGEMMA_ENABLED=true: prova comando diretto, poi interpreta con FunctionGemma
     """
     data = request.get_json(silent=True) or {}
     raw_message = data.get("message", "")
@@ -545,8 +578,7 @@ def send_message():
     print(f"{ANSI_CHAT}[chat] Messaggio ricevuto: {message}{ANSI_RESET}")
     add_log(f"Chat ricevuta: {message}", "user")
 
-    # Modalita temporanea: esegui SOLO comandi diretti supportati da CommandExecutor.
-    # Se il testo non rappresenta un comando noto, non fare nulla.
+    # Parsing comando e argomento opzionale
     match = re.match(r"^(.*?)(?:\s+(-?\d+))?$", message_trimmed)
     if match:
         direct_command = match.group(1).strip()
@@ -558,8 +590,18 @@ def send_message():
             add_log(f"Comando diretto chat eseguito: {msg_direct}", "success")
             return jsonify({"success": True, "message": msg_direct, "direct_command": True})
 
+        # Se comando non riconosciuto e FunctionGemma è DISABILITATO
         if "Comando sconosciuto" in msg_direct:
-            add_log("Nessun comando diretto riconosciuto (no-op)", "system")
+            if not FUNCTIONGEMMA_ENABLED:
+                add_log(f"Comando non riconosciuto e FunctionGemma disabilitato: {direct_command}", "warning")
+                return jsonify({
+                    "success": False,
+                    "message": f"Comando non riconosciuto: '{direct_command}'. FunctionGemma disabilitato - usa comandi esatti.",
+                    "direct_command": False,
+                    "functiongemma_disabled": True,
+                })
+            # FunctionGemma abilitato: prova a interpretare
+            add_log("Comando diretto non riconosciuto - tentativo interpretazione FunctionGemma", "system")
             return jsonify({
                 "success": True,
                 "message": "Nessun comando diretto riconosciuto",
@@ -569,6 +611,15 @@ def send_message():
         add_log(f"Errore comando diretto chat: {msg_direct}", "error")
         return jsonify({"success": False, "message": msg_direct, "direct_command": True})
 
+    # Se arriviamo qui, il parsing regex è fallito
+    if not FUNCTIONGEMMA_ENABLED:
+        return jsonify({
+            "success": False,
+            "message": "Formato messaggio non valido. FunctionGemma disabilitato - usa: comando [argomento]",
+            "functiongemma_disabled": True,
+        })
+
+    # FunctionGemma abilitato: interpreta il messaggio
     ok_llm, llm_output = call_functiongemma_from_text(message)
     if not ok_llm:
         print(f"{ANSI_MODEL}[chat] Errore FunctionGemma: {llm_output}{ANSI_RESET}")
@@ -808,6 +859,7 @@ def get_config():
         "CONTRAST_ALPHA": "Fattore contrasto immagine (default: 1.05)",
         "CONTRAST_BETA": "Offset contrasto immagine (default: 2)",
         "OCR_ENABLED": "Abilita invio frame a server OCR remoto",
+        "FUNCTIONGEMMA_ENABLED": "Abilita interpretazione comandi chat con FunctionGemma (se false, comandi esatti)",
         "OCR_SERVER_URL": "URL base del server RestOCR (es. https://ocr.sitai.duckdns.org)",
         "OCR_TIMEOUT": "Timeout richiesta OCR in secondi (default: 30)",
         "OCR_INTERVAL_SECONDS": "Intervallo minimo tra invii OCR in secondi (min: 1.0)",
