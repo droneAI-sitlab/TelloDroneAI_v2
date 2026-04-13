@@ -5,6 +5,7 @@
 ########################################################################
 """
 import os
+import sys
 import datetime
 import threading
 import time
@@ -17,6 +18,11 @@ import cv2
 import numpy as np
 from flask import Flask, Response, jsonify, render_template, request
 from dotenv import load_dotenv
+
+# ── Aggiungi vosk-voice al path per importare voice_module ─────────────
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "vosk-voice"))
+
+from voice_module import init_voice_module, voice_bp
 
 # ── Drone sub-modules ──────────────────────────────────────────────────
 from drone import wifi
@@ -1082,6 +1088,82 @@ def cleanup():
         error_msg = f"Errore cleanup: {str(exc)}"
         add_log(error_msg, "error")
         return jsonify({"success": False, "message": error_msg})
+
+
+########################################################################
+#  VOICE MODULE  –  Vosk speech-to-text integration
+########################################################################
+
+# Percorso al modello Vosk italiano
+VOSK_MODEL_PATH = os.path.join(os.path.dirname(__file__), "vosk-voice", "model-it")
+
+
+def _on_voice_transcription(text: str, session_id: int) -> None:
+    """
+    Callback chiamato quando Vosk produce una trascrizione finale.
+    Il testo viene processato esattamente come un messaggio chat.
+    """
+    print(f"{ANSI_CHAT}[voice] Trascrizione vocale: {text} (sessione: {session_id}){ANSI_RESET}")
+    add_log(f"Vocale: {text}", "user")
+    
+    # Processa il testo come un messaggio chat (senza HTTP request)
+    message_trimmed = text.strip()
+    if not message_trimmed:
+        return
+    
+    # Parsing comando e argomento opzionale
+    match = re.match(r"^(.*?)(?:\s+(-?\d+))?$", message_trimmed)
+    if match:
+        direct_command = match.group(1).strip()
+        direct_arg_raw = match.group(2)
+        direct_argument = int(direct_arg_raw) if direct_arg_raw is not None else None
+
+        ok_direct, msg_direct = command_executor.run(direct_command, direct_argument)
+        if ok_direct:
+            add_log(f"Comando vocale eseguito: {msg_direct}", "success")
+            return
+
+        if "Comando sconosciuto" not in msg_direct:
+            add_log(f"Errore comando vocale: {msg_direct}", "error")
+            return
+
+        if not FUNCTIONGEMMA_ENABLED:
+            add_log(f"Comando vocale non riconosciuto: {direct_command}", "warning")
+            return
+
+    # Se FunctionGemma è abilitato, interpreta il comando
+    if FUNCTIONGEMMA_ENABLED:
+        ok_llm, llm_output = call_functiongemma_from_text(message_trimmed)
+        if ok_llm:
+            parsed_commands = parse_model_output_to_executor_commands(llm_output)
+            if parsed_commands:
+                enqueued = enqueue_executor_commands(parsed_commands, source="voice")
+                add_log(f"Comandi vocali in buffer: {enqueued}/{len(parsed_commands)}", "success" if enqueued > 0 else "warning")
+            else:
+                add_log("Nessun comando estratto da input vocale", "warning")
+        else:
+            add_log(f"Errore FunctionGemma (voice): {llm_output}", "error")
+
+
+def _on_voice_partial(text: str, session_id: int) -> None:
+    """Callback per trascrizioni parziali (opzionale, solo log)."""
+    print(f"[voice] Parziale: {text}")
+
+
+# Inizializza il modulo vocale se il modello esiste
+if os.path.exists(VOSK_MODEL_PATH):
+    try:
+        init_voice_module(
+            app,
+            model_path=VOSK_MODEL_PATH,
+            on_transcription=_on_voice_transcription,
+            on_partial=_on_voice_partial
+        )
+        print(f"[app] Voice module inizializzato con modello: {VOSK_MODEL_PATH}")
+    except Exception as e:
+        print(f"[app] Errore inizializzazione voice module: {e}")
+else:
+    print(f"[app] Modello Vosk non trovato in: {VOSK_MODEL_PATH}")
 
 
 ########################################################################

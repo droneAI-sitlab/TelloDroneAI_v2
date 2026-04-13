@@ -18,8 +18,17 @@ const ui = {
     /** Whether the microphone is currently recording */
     isRecording: false,
 
-    /** Reference to the SpeechRecognition instance */
-    recognition: null,
+    /** WebSocket connection to Vosk backend */
+    voiceSocket: null,
+
+    /** AudioContext for capturing microphone audio */
+    audioContext: null,
+
+    /** MediaStream from getUserMedia */
+    micStream: null,
+
+    /** ScriptProcessorNode for audio processing */
+    audioProcessor: null,
 };
 
 
@@ -256,55 +265,164 @@ function handleInputKey(event) {
 
 
 // ================================================================
-//  MICROPHONE  –  Web Speech API for voice input
+//  MICROPHONE  –  Vosk WebSocket for voice input
 // ================================================================
 
 /** Toggle microphone recording on/off. */
 function toggleMic() {
     const btn = document.getElementById("mic-btn");
-    const SR  = window.SpeechRecognition || window.webkitSpeechRecognition;
-
-    if (!SR) {
-        addLocalLog("error", "Riconoscimento vocale non supportato da questo browser");
-        return;
-    }
 
     if (ui.isRecording) {
         // ── Stop recording ─────────────────────────────────────────
-        ui.recognition?.stop();
-        ui.isRecording = false;
+        _stopVoiceRecognition();
         btn.classList.remove("recording");
         return;
     }
 
     // ── Start recording ───────────────────────────────────────────
-    ui.recognition = new SR();
-    ui.recognition.lang            = "it-IT";
-    ui.recognition.interimResults  = false;
-    ui.recognition.maxAlternatives = 1;
+    _startVoiceRecognition();
+}
 
-    ui.recognition.onstart = () => {
-        ui.isRecording = true;
-        btn.classList.add("recording");
-        addLocalLog("info", "Microfono attivo, in ascolto…");
-    };
+/**
+ * Start voice recognition via WebSocket to Vosk backend.
+ */
+async function _startVoiceRecognition() {
+    const btn = document.getElementById("mic-btn");
 
-    ui.recognition.onresult = (event) => {
-        const transcript = event.results[0][0].transcript;
-        document.getElementById("message-input").value = transcript;
-        addLocalLog("info", "Riconosciuto: " + transcript);
-    };
+    try {
+        // Richiedi accesso al microfono
+        ui.micStream = await navigator.mediaDevices.getUserMedia({ 
+            audio: {
+                echoCancellation: true,
+                noiseSuppression: true,
+                sampleRate: 16000
+            } 
+        });
 
-    ui.recognition.onerror = (event) => {
-        addLocalLog("error", "Errore microfono: " + event.error);
-    };
+        // Crea AudioContext a 16kHz (richiesto da Vosk)
+        ui.audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+        const source = ui.audioContext.createMediaStreamSource(ui.micStream);
 
-    ui.recognition.onend = () => {
-        ui.isRecording = false;
-        btn.classList.remove("recording");
-    };
+        // Crea ScriptProcessor per catturare e convertire l'audio
+        ui.audioProcessor = ui.audioContext.createScriptProcessor(4096, 1, 1);
+        
+        ui.audioProcessor.onaudioprocess = (e) => {
+            if (!ui.voiceSocket || ui.voiceSocket.readyState !== WebSocket.OPEN) return;
+            
+            // Converti Float32 a Int16 PCM (formato richiesto da Vosk)
+            const inputData = e.inputBuffer.getChannelData(0);
+            const pcmData = new Int16Array(inputData.length);
+            
+            for (let i = 0; i < inputData.length; i++) {
+                // Clampa e converte in 16-bit PCM
+                const sample = Math.max(-1, Math.min(1, inputData[i]));
+                pcmData[i] = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
+            }
+            
+            // Invia i dati PCM al backend via WebSocket
+            ui.voiceSocket.send(pcmData.buffer);
+        };
 
-    ui.recognition.start();
+        source.connect(ui.audioProcessor);
+        ui.audioProcessor.connect(ui.audioContext.destination);
+
+        // Connetti WebSocket al backend Vosk
+        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const wsUrl = `${protocol}//${window.location.host}/ws`;
+        
+        ui.voiceSocket = new WebSocket(wsUrl);
+
+        ui.voiceSocket.onopen = () => {
+            ui.isRecording = true;
+            btn.classList.add("recording");
+            addLocalLog("info", "🎤 Microfono attivo, in ascolto...");
+            console.log("[voice] WebSocket connesso, registrazione avviata");
+        };
+
+        ui.voiceSocket.onmessage = (event) => {
+            try {
+                const data = JSON.parse(event.data);
+                
+                if (data.error) {
+                    addLocalLog("error", "Errore riconoscimento: " + data.error);
+                    _stopVoiceRecognition();
+                    return;
+                }
+
+                if (data.is_final && data.text) {
+                    // Trascrizione finale: popola l'input e (opzionale) invia
+                    const input = document.getElementById("message-input");
+                    input.value = data.text;
+                    addLocalLog("info", "📝 Riconosciuto: " + data.text);
+                    
+                    // Auto-invia il messaggio dopo la trascrizione
+                    // Commenta la riga seguente se preferisci conferma manuale
+                    sendMessage();
+                } else if (data.text) {
+                    // Feedback parziale (opzionale)
+                    console.log("[voice] Parziale:", data.text);
+                }
+            } catch (err) {
+                console.error("[voice] Errore parsing messaggio:", err);
+            }
+        };
+
+        ui.voiceSocket.onerror = (error) => {
+            addLocalLog("error", "Errore WebSocket vocale");
+            console.error("[voice] WebSocket error:", error);
+            _stopVoiceRecognition();
+        };
+
+        ui.voiceSocket.onclose = () => {
+            console.log("[voice] WebSocket chiuso");
+            _stopVoiceRecognition();
+        };
+
+    } catch (err) {
+        addLocalLog("error", "Errore accesso microfono: " + err.message);
+        console.error("[voice] Errore:", err);
+        _stopVoiceRecognition();
+    }
+}
+
+/**
+ * Stop voice recognition and cleanup resources.
+ */
+function _stopVoiceRecognition() {
+    const btn = document.getElementById("mic-btn");
+    
+    // Chiudi WebSocket
+    if (ui.voiceSocket) {
+        try {
+            ui.voiceSocket.close();
+        } catch (e) {}
+        ui.voiceSocket = null;
+    }
+
+    // Ferma stream microfono
+    if (ui.micStream) {
+        ui.micStream.getTracks().forEach(track => track.stop());
+        ui.micStream = null;
+    }
+
+    // Disconnetti e chiudi AudioContext
+    if (ui.audioProcessor) {
+        try {
+            ui.audioProcessor.disconnect();
+        } catch (e) {}
+        ui.audioProcessor = null;
+    }
+
+    if (ui.audioContext) {
+        try {
+            ui.audioContext.close();
+        } catch (e) {}
+        ui.audioContext = null;
+    }
+
+    // Aggiorna UI
+    ui.isRecording = false;
+    btn.classList.remove("recording");
 }
 
 
