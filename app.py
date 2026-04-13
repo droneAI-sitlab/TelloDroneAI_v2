@@ -10,6 +10,8 @@ import threading
 import time
 import queue
 import re
+import json
+import itertools
 
 import cv2
 import numpy as np
@@ -26,13 +28,24 @@ from drone.ollama_client import (
     call_ollama_from_ocr_words,
     call_functiongemma_from_text,
     parse_model_output_to_executor_commands,
+    get_ollama_config,
 )
 from drone.command_executor import CommandExecutor
 
 # ── Load environment variables from .env ──────────────────────────────
-load_dotenv()
+# override=True evita che vecchie variabili di ambiente del processo
+# mantengano valori stale (es. FUNCTIONGEMMA_ENABLED=false).
+load_dotenv(override=True)
 
 app = Flask(__name__)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Parsa bool da .env in modo case-insensitive e con fallback sicuro."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 ########################################################################
 #  CONFIGURATION  (values come from .env, with sensible defaults)
@@ -42,7 +55,7 @@ app.secret_key = os.getenv("SECRET_KEY", "dev-secret-key-change-in-prod")
 
 FLASK_HOST  = os.getenv("FLASK_HOST", "0.0.0.0")
 FLASK_PORT  = int(os.getenv("FLASK_PORT", 5000))
-FLASK_DEBUG = os.getenv("FLASK_DEBUG", "True") == "True"
+FLASK_DEBUG = _env_bool("FLASK_DEBUG", True)
 
 DRONE_IP    = os.getenv("DRONE_IP",    "192.168.10.1")
 DRONE_PORT  = int(os.getenv("DRONE_PORT",  8889))
@@ -58,7 +71,7 @@ WIFI_TIMEOUT          = int(os.getenv("WIFI_CONNECT_TIMEOUT", 15))
 FRAME_WIDTH           = int(os.getenv("FRAME_WIDTH",          960))
 FRAME_HEIGHT          = int(os.getenv("FRAME_HEIGHT",         720))
 JPEG_QUALITY          = int(os.getenv("JPEG_QUALITY",         80))
-FRAME_ENABLE_CONTRAST = os.getenv("ENABLE_CONTRAST",          "True") == "True"
+FRAME_ENABLE_CONTRAST = _env_bool("ENABLE_CONTRAST", True)
 FRAME_CONTRAST_ALPHA  = float(os.getenv("CONTRAST_ALPHA",     1.05))
 FRAME_CONTRAST_BETA   = int(os.getenv("CONTRAST_BETA",        2))
 TARGET_FPS            = float(os.getenv("TARGET_FPS",         30.0))
@@ -66,12 +79,12 @@ TARGET_FPS            = float(os.getenv("TARGET_FPS",         30.0))
 # ── OCR remoto ────────────────────────────────────────────────────────
 # La configurazione dettagliata (URL, intervallo, qualità, soglia) viene
 # letta direttamente da .env all'interno di OCRSender tramite load_dotenv.
-OCR_ENABLED = os.getenv("OCR_ENABLED", "True") == "True"
+OCR_ENABLED = _env_bool("OCR_ENABLED", True)
 
 # ── FunctionGemma (interpretazione comandi chat) ───────────────────────
 # Se disabilitato, i comandi dalla chat devono essere scritti esattamente
 # (case-insensitive: "takeoff", "move_forward 50", "avanti 30")
-FUNCTIONGEMMA_ENABLED = os.getenv("FUNCTIONGEMMA_ENABLED", "True") == "True"
+FUNCTIONGEMMA_ENABLED = _env_bool("FUNCTIONGEMMA_ENABLED", True)
 
 # ── Buffer comandi da FunctionGemma ───────────────────────────────────
 COMMAND_BUFFER_DELAY_SECONDS = float(os.getenv("COMMAND_BUFFER_DELAY_SECONDS", "2.0"))
@@ -88,6 +101,7 @@ ANSI_RESET  = "\033[0m"
 ANSI_CHAT   = "\033[96m"
 ANSI_MODEL  = "\033[95m"
 ANSI_BUFFER = "\033[93m"
+ANSI_FUNC   = "\033[92m"
 
 
 ########################################################################
@@ -124,6 +138,17 @@ def add_log(message: str, level: str = "info") -> None:
             app_state["logs"] = app_state["logs"][-LOG_MAX_ENTRIES:]
 
 
+def echo_functiongemma_terminal(title: str, payload: dict | None = None) -> None:
+    """Stampa debug FunctionGemma in colore dedicato con payload formattato."""
+    print(f"{ANSI_FUNC}[functiongemma] {title}{ANSI_RESET}")
+    if payload is not None:
+        try:
+            pretty = json.dumps(payload, ensure_ascii=False, indent=2)
+        except Exception:
+            pretty = str(payload)
+        print(f"{ANSI_FUNC}{pretty}{ANSI_RESET}")
+
+
 ########################################################################
 #  DRONE SINGLETONS  – istanze globali condivise tra tutte le request
 ########################################################################
@@ -152,14 +177,28 @@ media_capture = DroneMediaCapture(drone_reader)
 command_executor = CommandExecutor(drone_reader, media_capture=media_capture)
 
 
-# Coda FIFO: i comandi vengono eseguiti in sequenza con delay tra uno e il successivo
-command_buffer: queue.Queue[tuple[str, int | None]] = queue.Queue(maxsize=COMMAND_BUFFER_MAX_SIZE)
+# Coda prioritaria: emergency > comandi normali > keepalive/meta-pausa
+_command_sequence = itertools.count()
+PRIORITY_EMERGENCY = command_executor.emergency_priority_value()
+QUEUE_LOW_PRIORITY_COMMANDS = {META_PAUSE_COMMAND}
+
+command_buffer: queue.PriorityQueue[tuple[int, int, str, int | None]] = queue.PriorityQueue(
+    maxsize=COMMAND_BUFFER_MAX_SIZE
+)
 
 # Buffer permanente: usato solo quando la coda temporanea e' vuota e il drone e' in volo
 PERMANENT_BUFFER_COMMANDS: list[tuple[str, int | None]] = [
     ("send_keepalive", None),
     (META_PAUSE_COMMAND, None),
 ]
+
+
+def _has_pending_emergency() -> bool:
+    """Controlla se il prossimo comando in coda ha priorita' emergency."""
+    with command_buffer.mutex:
+        if not command_buffer.queue:
+            return False
+        return command_buffer.queue[0][0] == PRIORITY_EMERGENCY
 
 
 def enqueue_executor_commands(commands: list[tuple[str, int | None]], source: str = "ocr") -> int:
@@ -169,9 +208,17 @@ def enqueue_executor_commands(commands: list[tuple[str, int | None]], source: st
     enqueued = 0
     for command_name, argument in commands:
         try:
-            command_buffer.put_nowait((command_name, argument))
+            priority = command_executor.get_command_priority(
+                command_name,
+                keepalive_commands=QUEUE_LOW_PRIORITY_COMMANDS,
+            )
+            sequence = next(_command_sequence)
+            command_buffer.put_nowait((priority, sequence, command_name, argument))
             enqueued += 1
-            msg = f"Buffered command ({source}): {command_name} {argument if argument is not None else ''}".rstrip()
+            msg = (
+                f"Buffered command ({source}): {command_name} "
+                f"{argument if argument is not None else ''} [p={priority}]"
+            ).rstrip()
             print(f"{ANSI_BUFFER}[app] {msg}{ANSI_RESET}")
             add_log(msg, "system")
         except queue.Full:
@@ -197,7 +244,12 @@ def _enqueue_permanent_buffer_if_needed(trigger: str) -> int:
     enqueued = 0
     for command_name, argument in PERMANENT_BUFFER_COMMANDS:
         try:
-            command_buffer.put_nowait((command_name, argument))
+            priority = command_executor.get_command_priority(
+                command_name,
+                keepalive_commands=QUEUE_LOW_PRIORITY_COMMANDS,
+            )
+            sequence = next(_command_sequence)
+            command_buffer.put_nowait((priority, sequence, command_name, argument))
             enqueued += 1
         except queue.Full:
             break
@@ -215,26 +267,29 @@ def _command_buffer_worker() -> None:
     Worker dedicato: esegue comandi dalla coda con una pausa configurabile tra esecuzioni.
     """
     while True:
-        command_name, argument = command_buffer.get()
+        _, _, command_name, argument = command_buffer.get()
         try:
             if command_name == "send_keepalive":
-                ok_cmd, msg_cmd = command_executor.run(command_name, argument)
-                if not ok_cmd:
-                    # Fallback robusto: una query SDK mantiene viva la sessione anche
-                    # sui firmware che non rispondono al comando keepalive.
-                    ok_fallback, msg_fallback = command_executor.run("get_battery", None)
-                    if ok_fallback:
-                        battery_level = drone_reader.get_battery()
-                        with _state_lock:
-                            app_state["battery"] = battery_level
-                        ok_cmd = True
-                        msg_cmd = (
-                            f"keepalive non confermato ({msg_cmd}); "
-                            f"fallback ok: {msg_fallback}"
-                        )
-                        add_log("Keepalive non confermato: usato fallback get_battery", "warning")
-                    else:
-                        msg_cmd = f"{msg_cmd} | fallback get_battery fallito: {msg_fallback}"
+                if not command_executor.is_flying():
+                    ok_cmd, msg_cmd = True, "skip – send_keepalive (drone a terra)"
+                else:
+                    ok_cmd, msg_cmd = command_executor.run(command_name, argument)
+                    if not ok_cmd:
+                        # Fallback robusto: una query SDK mantiene viva la sessione anche
+                        # sui firmware che non rispondono al comando keepalive.
+                        ok_fallback, msg_fallback = command_executor.run("get_battery", None)
+                        if ok_fallback:
+                            battery_level = drone_reader.get_battery()
+                            with _state_lock:
+                                app_state["battery"] = battery_level
+                            ok_cmd = True
+                            msg_cmd = (
+                                f"keepalive non confermato ({msg_cmd}); "
+                                f"fallback ok: {msg_fallback}"
+                            )
+                            add_log("Keepalive non confermato: usato fallback get_battery", "warning")
+                        else:
+                            msg_cmd = f"{msg_cmd} | fallback get_battery fallito: {msg_fallback}"
             elif command_name == META_PAUSE_COMMAND:
                 pause_seconds = max(0.0, PERMANENT_BUFFER_PAUSE_SECONDS)
                 if pause_seconds > 0:
@@ -258,7 +313,14 @@ def _command_buffer_worker() -> None:
 
         # Delay tra un comando e il successivo (la meta pausa gestisce gia il proprio wait)
         if command_name != META_PAUSE_COMMAND and COMMAND_BUFFER_DELAY_SECONDS > 0:
-            time.sleep(COMMAND_BUFFER_DELAY_SECONDS)
+            waited = 0.0
+            step = 0.05
+            while waited < COMMAND_BUFFER_DELAY_SECONDS:
+                if _has_pending_emergency():
+                    break
+                chunk = min(step, COMMAND_BUFFER_DELAY_SECONDS - waited)
+                time.sleep(chunk)
+                waited += chunk
 
         if command_name != META_PAUSE_COMMAND:
             _enqueue_permanent_buffer_if_needed("worker-empty")
@@ -277,8 +339,8 @@ KEEPALIVE_MAX_FAILURES = 3
 
 def _always_keepalive_loop() -> None:
     """
-    Keepalive sempre attivo quando stream e connessione drone sono disponibili,
-    indipendente da chat, buffer temporaneo o buffer permanente.
+    Keepalive globale quando stream attivo E drone in volo.
+    E' indipendente da chat, buffer temporaneo o buffer permanente.
     Include logica di riconnessione automatica dopo fallimenti ripetuti.
     """
     interval = max(2.0, ALWAYS_KEEPALIVE_INTERVAL_SECONDS)
@@ -291,6 +353,10 @@ def _always_keepalive_loop() -> None:
             stream_on = app_state["stream_active"]
         if not stream_on:
             consecutive_failures = 0  # Reset se stream non attivo
+            continue
+
+        if not command_executor.is_flying():
+            consecutive_failures = 0  # Nessun keepalive se drone a terra
             continue
 
         ok_keepalive, msg_keepalive = command_executor.run("send_keepalive", None)
@@ -577,6 +643,10 @@ def send_message():
     # Stampa in terminale esattamente il testo ricevuto, senza alterarlo.
     print(f"{ANSI_CHAT}[chat] Messaggio ricevuto: {message}{ANSI_RESET}")
     add_log(f"Chat ricevuta: {message}", "user")
+    echo_functiongemma_terminal(
+        "Stato flag FunctionGemma per questa richiesta",
+        {"enabled": FUNCTIONGEMMA_ENABLED},
+    )
 
     # Parsing comando e argomento opzionale
     match = re.match(r"^(.*?)(?:\s+(-?\d+))?$", message_trimmed)
@@ -590,43 +660,64 @@ def send_message():
             add_log(f"Comando diretto chat eseguito: {msg_direct}", "success")
             return jsonify({"success": True, "message": msg_direct, "direct_command": True})
 
-        # Se comando non riconosciuto e FunctionGemma è DISABILITATO
-        if "Comando sconosciuto" in msg_direct:
-            if not FUNCTIONGEMMA_ENABLED:
-                add_log(f"Comando non riconosciuto e FunctionGemma disabilitato: {direct_command}", "warning")
-                return jsonify({
-                    "success": False,
-                    "message": f"Comando non riconosciuto: '{direct_command}'. FunctionGemma disabilitato - usa comandi esatti.",
-                    "direct_command": False,
-                    "functiongemma_disabled": True,
-                })
-            # FunctionGemma abilitato: prova a interpretare
-            add_log("Comando diretto non riconosciuto - tentativo interpretazione FunctionGemma", "system")
+        if "Comando sconosciuto" not in msg_direct:
+            add_log(f"Errore comando diretto chat: {msg_direct}", "error")
+            return jsonify({"success": False, "message": msg_direct, "direct_command": True})
+
+        if not FUNCTIONGEMMA_ENABLED:
+            add_log(f"Comando non riconosciuto e FunctionGemma disabilitato: {direct_command}", "warning")
+            echo_functiongemma_terminal(
+                "Tentativo chiamata NON eseguito (FunctionGemma disabilitato)",
+                {
+                    "enabled": FUNCTIONGEMMA_ENABLED,
+                    "input": message,
+                    "reason": "comando diretto non riconosciuto",
+                },
+            )
             return jsonify({
-                "success": True,
-                "message": "Nessun comando diretto riconosciuto",
+                "success": False,
+                "message": f"Comando non riconosciuto: '{direct_command}'. FunctionGemma disabilitato - usa comandi esatti.",
                 "direct_command": False,
+                "functiongemma_disabled": True,
             })
 
-        add_log(f"Errore comando diretto chat: {msg_direct}", "error")
-        return jsonify({"success": False, "message": msg_direct, "direct_command": True})
-
-    # Se arriviamo qui, il parsing regex è fallito
-    if not FUNCTIONGEMMA_ENABLED:
+        add_log("Comando diretto non riconosciuto - tentativo interpretazione FunctionGemma", "system")
+        echo_functiongemma_terminal(
+            "Tentativo chiamata dopo comando diretto non riconosciuto",
+            {"enabled": FUNCTIONGEMMA_ENABLED, "input": message},
+        )
+    elif not FUNCTIONGEMMA_ENABLED:
+        echo_functiongemma_terminal(
+            "Tentativo chiamata NON eseguito (FunctionGemma disabilitato)",
+            {
+                "enabled": FUNCTIONGEMMA_ENABLED,
+                "input": message,
+                "reason": "formato comando diretto non valido",
+            },
+        )
         return jsonify({
             "success": False,
             "message": "Formato messaggio non valido. FunctionGemma disabilitato - usa: comando [argomento]",
             "functiongemma_disabled": True,
         })
 
-    # FunctionGemma abilitato: interpreta il messaggio
+    cfg = get_ollama_config()
+    fg_payload = {
+        "endpoint": f"{cfg['url']}/api/chat",
+        "model": cfg["functiongemma_model"],
+        "stream": False,
+        "options": {"temperature": cfg["temperature"]},
+        "messages": [{"role": "user", "content": message}],
+    }
+    echo_functiongemma_terminal("Invio richiesta FunctionGemma", fg_payload)
+
     ok_llm, llm_output = call_functiongemma_from_text(message)
     if not ok_llm:
-        print(f"{ANSI_MODEL}[chat] Errore FunctionGemma: {llm_output}{ANSI_RESET}")
+        echo_functiongemma_terminal("Errore risposta FunctionGemma", {"error": llm_output})
         add_log(f"Errore FunctionGemma: {llm_output}", "error")
         return jsonify({"success": False, "message": f"Errore FunctionGemma: {llm_output}"})
 
-    print(f"{ANSI_MODEL}[chat] FunctionGemma output: {llm_output}{ANSI_RESET}")
+    echo_functiongemma_terminal("Risposta FunctionGemma ricevuta", {"output": llm_output})
     add_log("Output FunctionGemma ricevuto dalla chat", "system")
 
     parsed_commands = parse_model_output_to_executor_commands(llm_output)
@@ -871,7 +962,7 @@ def get_config():
         "COMMAND_BUFFER_DELAY_SECONDS": "Delay tra comandi eseguiti dal buffer (default: 2.0)",
         "COMMAND_BUFFER_MAX_SIZE": "Dimensione massima coda comandi (default: 50)",
         "PERMANENT_BUFFER_PAUSE_SECONDS": "Durata meta comando *pausa in secondi (default: 5.0)",
-        "ALWAYS_KEEPALIVE_INTERVAL_SECONDS": "Intervallo keepalive globale in secondi quando stream e' attivo (default: 8.0)",
+        "ALWAYS_KEEPALIVE_INTERVAL_SECONDS": "Intervallo keepalive globale in secondi quando stream e drone sono in volo (default: 5.0)",
         "MEDIA_OUTPUT_DIR": "Directory dove salvare foto/video (default: captures)",
         "MEDIA_VIDEO_FPS": "FPS di registrazione video (default: 20.0)",
         "MEDIA_VIDEO_CODEC": "Codec FourCC video (default: mp4v)",

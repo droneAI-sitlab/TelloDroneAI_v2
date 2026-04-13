@@ -48,6 +48,11 @@ _DEFAULT_MOVE:  int = 30   # cm
 _DEFAULT_ANGLE: int = 90   # gradi
 _DEFAULT_SPEED: int = 30   # cm/s
 
+# Priorita' coda comandi (numero minore = precedenza maggiore)
+COMMAND_PRIORITY_EMERGENCY: int = 0
+COMMAND_PRIORITY_NORMAL: int = 10
+COMMAND_PRIORITY_KEEPALIVE: int = 100
+
 
 ########################################################################
 #  TABELLA COMANDI
@@ -377,34 +382,34 @@ class CommandExecutor:
         """
         with self._state_lock:
             internal_state = self._is_flying
-        
-        # Se lo stato interno dice "non in volo", non serve interrogare il drone
-        if not internal_state:
-            return False
-        
-        # Tenta di verificare con telemetria reale
+
+        # Usa prima il flag SDK locale (djitellopy.Tello.is_flying),
+        # aggiornato direttamente da takeoff()/land().
         tello = self._reader.get_tello()
         if tello is None:
-            # Drone non connesso - fallback allo stato interno
-            return internal_state
+            return False
+
+        sdk_state = bool(getattr(tello, "is_flying", internal_state))
+        if not sdk_state:
+            with self._state_lock:
+                self._is_flying = False
+            return False
+
+        # Se SDK dice in volo, prova a validare con altezza reale.
+        # In caso di errore telemetria, mantieni lo stato SDK.
+        confirmed_flying = True
         
         try:
-            # Query altezza dal drone (cm)
-            # Se altezza > 10cm, il drone e' probabilmente in volo
             height = tello.get_height()
-            if height is not None and height > 10:
-                return True
-            elif height is not None and height <= 10:
-                # Drone a terra ma flag interno dice "flying" - auto-landing rilevato
-                # Aggiorna lo stato interno per consistenza
-                with self._state_lock:
-                    self._is_flying = False
-                return False
+            if height is not None and height <= 10:
+                confirmed_flying = False
         except Exception:
-            # Errore query telemetria - fallback allo stato interno
             pass
-        
-        return internal_state
+
+        with self._state_lock:
+            self._is_flying = confirmed_flying
+
+        return confirmed_flying
 
     def reset_flight_state(self) -> None:
         """Reset esplicito da usare dopo cleanup/disconnessioni."""
@@ -482,6 +487,34 @@ class CommandExecutor:
                 "desc":    entry["desc"],
             })
         return result
+
+    @staticmethod
+    def emergency_priority_value() -> int:
+        """Valore numerico di priorita' per il comando emergency."""
+        return COMMAND_PRIORITY_EMERGENCY
+
+    def get_command_priority(
+        self,
+        command: str,
+        keepalive_commands: Optional[set[str]] = None,
+    ) -> int:
+        """
+        Ritorna la priorita' del comando per la coda:
+        - emergency: massima priorita'
+        - keepalive/meta-comandi: minima priorita'
+        - altri: priorita' normale
+        """
+        normalized = re.sub(r"[\s\-]+", "_", str(command or "").strip().lower())
+
+        if keepalive_commands and normalized in keepalive_commands:
+            return COMMAND_PRIORITY_KEEPALIVE
+
+        canonical = self._resolve(normalized)
+        if canonical == "emergency":
+            return COMMAND_PRIORITY_EMERGENCY
+        if canonical == "send_keepalive":
+            return COMMAND_PRIORITY_KEEPALIVE
+        return COMMAND_PRIORITY_NORMAL
 
     # ----------------------------------------------------------------
     #  METODI INTERNI
