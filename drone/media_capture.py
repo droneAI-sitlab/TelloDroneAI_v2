@@ -31,6 +31,20 @@ class DroneMediaCapture:
         self._video_writer: Optional[cv2.VideoWriter] = None
         self._recording_path: Optional[str] = None
 
+    def reload_from_env(self) -> None:
+        """Rilegge i parametri media da .env e li applica per le prossime acquisizioni."""
+        with self._lock:
+            self._output_dir = os.getenv("MEDIA_OUTPUT_DIR", self._output_dir)
+            try:
+                self._video_fps = float(os.getenv("MEDIA_VIDEO_FPS", str(self._video_fps)))
+            except (TypeError, ValueError):
+                pass
+            self._video_fps = max(1.0, self._video_fps)
+
+            codec = str(os.getenv("MEDIA_VIDEO_CODEC", self._video_codec)).strip()
+            if codec:
+                self._video_codec = codec
+
     def take_photo(self) -> str:
         """Scatta una foto dal frame corrente e ritorna il path del file."""
         frame = self._reader.get_frame()

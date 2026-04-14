@@ -23,8 +23,10 @@
 ########################################################################
 """
 
+import os
 import re
 import threading
+import time
 from typing import Optional, Tuple
 
 from drone.frame_reader import DroneReader
@@ -267,6 +269,7 @@ class CommandExecutor:
         self,
         drone_reader: DroneReader,
         media_capture: Optional[DroneMediaCapture] = None,
+        dedupe_window_seconds: Optional[float] = None,
     ) -> None:
         """
         Args:
@@ -277,7 +280,16 @@ class CommandExecutor:
         self._media_capture = media_capture
         self._state_lock = threading.Lock()
         self._is_flying = False
-        print("[command_executor] Inizializzato")
+        self._dedupe_window_seconds = self._resolve_dedupe_window_seconds(dedupe_window_seconds)
+        self._dedupe_lock = threading.Lock()
+        self._last_success_signature: Optional[tuple[str, Optional[int]]] = None
+        self._last_success_monotonic = 0.0
+        self._inflight_signatures: set[tuple[str, Optional[int]]] = set()
+        self._dedupe_exempt_commands = {"send_keepalive", "get_battery", "emergency"}
+        print(
+            "[command_executor] Inizializzato "
+            f"(dedupe={self._dedupe_window_seconds:.2f}s)"
+        )
 
     # ----------------------------------------------------------------
     #  API PUBBLICA
@@ -324,12 +336,29 @@ class CommandExecutor:
             return False, effective_arg
 
         # ── 4. Esecuzione lambda dalla tabella ─────────────────────────
+        signature = (canonical, effective_arg)
+        skip_duplicate, skip_message, guard_active = self._begin_dedupe_guard(
+            canonical=canonical,
+            effective_arg=effective_arg,
+            unit=entry["unit"],
+            signature=signature,
+        )
+        if skip_duplicate:
+            print(f"[command_executor] {skip_message}")
+            return True, skip_message
+
+        fn_result = None
+        execution_ok = False
         try:
             fn_result = entry["fn"](tello, effective_arg)
+            execution_ok = True
         except Exception as exc:
             msg = f"Errore SDK su '{canonical}': {exc}"
             print(f"[command_executor] {msg}")
             return False, msg
+        finally:
+            if guard_active:
+                self._end_dedupe_guard(signature, success=execution_ok)
 
         if canonical == "takeoff":
             with self._state_lock:
@@ -349,6 +378,88 @@ class CommandExecutor:
         log    = f"[command_executor] {canonical} {detail}".strip()
         print(log)
         return True, f"ok – {canonical} {detail}".strip()
+
+    @staticmethod
+    def _resolve_dedupe_window_seconds(explicit_value: Optional[float]) -> float:
+        """Legge la finestra di deduplica da argomento o da variabile ambiente."""
+        if explicit_value is not None:
+            try:
+                return max(0.0, float(explicit_value))
+            except (TypeError, ValueError):
+                return 0.0
+
+        raw = os.getenv("COMMAND_DEDUP_WINDOW_SECONDS", "1.2")
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return 1.2
+
+    def _begin_dedupe_guard(
+        self,
+        canonical: str,
+        effective_arg: Optional[int],
+        unit: str,
+        signature: tuple[str, Optional[int]],
+    ) -> tuple[bool, str, bool]:
+        """
+        Gestisce deduplica concorrente:
+        - blocca duplicati gia' in esecuzione
+        - blocca duplicati appena eseguiti nella finestra configurata
+
+        Returns:
+            (skip, message, guard_active)
+        """
+        if self._dedupe_window_seconds <= 0:
+            return False, "", False
+
+        if canonical in self._dedupe_exempt_commands:
+            return False, "", False
+
+        now = time.monotonic()
+        detail = f"{effective_arg}{unit}" if effective_arg is not None else ""
+
+        with self._dedupe_lock:
+            if signature in self._inflight_signatures:
+                return True, f"skip – duplicate in-flight: {canonical} {detail}".strip(), False
+
+            if self._last_success_signature == signature:
+                elapsed = now - self._last_success_monotonic
+                if elapsed < self._dedupe_window_seconds:
+                    elapsed_ms = int(elapsed * 1000)
+                    return (
+                        True,
+                        f"skip – duplicate recente ({elapsed_ms}ms): {canonical} {detail}".strip(),
+                        False,
+                    )
+
+            self._inflight_signatures.add(signature)
+
+        return False, "", True
+
+    def _end_dedupe_guard(self, signature: tuple[str, Optional[int]], success: bool) -> None:
+        """Chiude la guardia dedupe e aggiorna lo storico in caso di successo."""
+        now = time.monotonic()
+        with self._dedupe_lock:
+            self._inflight_signatures.discard(signature)
+            if success:
+                self._last_success_signature = signature
+                self._last_success_monotonic = now
+
+    def set_dedupe_window_seconds(self, value: float) -> float:
+        """Aggiorna a caldo la finestra anti-duplicato dei comandi."""
+        try:
+            normalized = max(0.0, float(value))
+        except (TypeError, ValueError):
+            normalized = self._dedupe_window_seconds
+
+        with self._dedupe_lock:
+            self._dedupe_window_seconds = normalized
+            if normalized <= 0:
+                self._inflight_signatures.clear()
+                self._last_success_signature = None
+                self._last_success_monotonic = 0.0
+
+        return self._dedupe_window_seconds
 
     def _run_media_command(self, canonical: str) -> Tuple[bool, str]:
         """Esegue i comandi media tramite DroneMediaCapture."""

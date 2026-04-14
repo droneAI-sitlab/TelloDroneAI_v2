@@ -62,6 +62,24 @@ class FrameProcessor:
         # ── Parametri JPEG encoder ─────────────────────────────────────
         self._encode_params = [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality]
 
+    def update_config(
+        self,
+        width: int,
+        height: int,
+        jpeg_quality: int,
+        enable_contrast: bool,
+        contrast_alpha: float,
+        contrast_beta: int,
+    ) -> None:
+        """Applica a caldo una nuova configurazione della pipeline frame."""
+        self.width = max(1, int(width))
+        self.height = max(1, int(height))
+        self.jpeg_quality = max(0, min(100, int(jpeg_quality)))
+        self.enable_contrast = bool(enable_contrast)
+        self.contrast_alpha = float(contrast_alpha)
+        self.contrast_beta = int(contrast_beta)
+        self._encode_params = [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality]
+
     # ----------------------------------------------------------------
     #  PIPELINE PRINCIPALE
     # ----------------------------------------------------------------

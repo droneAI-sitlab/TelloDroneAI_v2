@@ -107,6 +107,42 @@ class OCRSender:
             f" | confidenza_min={self._min_conf:.0%}"
         )
 
+    def reload_from_env(self) -> None:
+        """Rilegge i parametri OCR dal .env e li applica a caldo."""
+        load_dotenv(override=True)
+
+        def _safe_int(name: str, fallback: int) -> int:
+            raw = os.getenv(name)
+            if raw is None:
+                return fallback
+            try:
+                return int(str(raw).strip())
+            except (TypeError, ValueError):
+                return fallback
+
+        def _safe_float(name: str, fallback: float) -> float:
+            raw = os.getenv(name)
+            if raw is None:
+                return fallback
+            try:
+                return float(str(raw).strip())
+            except (TypeError, ValueError):
+                return fallback
+
+        with self._lock:
+            self._server_url = os.getenv("OCR_SERVER_URL", self._server_url).rstrip("/")
+            self._timeout = _safe_int("OCR_TIMEOUT", self._timeout)
+            self._interval = max(0.1, _safe_float("OCR_INTERVAL_SECONDS", self._interval))
+            self._jpeg_quality = max(0, min(100, _safe_int("OCR_JPEG_QUALITY", self._jpeg_quality)))
+            self._min_conf = max(0.0, min(1.0, _safe_float("OCR_MIN_CONFIDENCE", self._min_conf)))
+            self._encode_params = [cv2.IMWRITE_JPEG_QUALITY, self._jpeg_quality]
+
+        print(
+            f"[ocr_sender] Config aggiornata → server={self._server_url}"
+            f" | intervallo={self._interval}s"
+            f" | confidenza_min={self._min_conf:.0%}"
+        )
+
     # ----------------------------------------------------------------
     #  API PUBBLICA
     # ----------------------------------------------------------------

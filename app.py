@@ -44,6 +44,8 @@ from drone.command_executor import CommandExecutor
 load_dotenv(override=True)
 
 app = Flask(__name__)
+app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
+app.config["TEMPLATES_AUTO_RELOAD"] = True
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -52,6 +54,28 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    """Parsa int da .env con fallback sicuro."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    """Parsa float da .env con fallback sicuro."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
 
 ########################################################################
 #  CONFIGURATION  (values come from .env, with sensible defaults)
@@ -97,6 +121,8 @@ COMMAND_BUFFER_DELAY_SECONDS = float(os.getenv("COMMAND_BUFFER_DELAY_SECONDS", "
 COMMAND_BUFFER_MAX_SIZE = int(os.getenv("COMMAND_BUFFER_MAX_SIZE", "50"))
 PERMANENT_BUFFER_PAUSE_SECONDS = float(os.getenv("PERMANENT_BUFFER_PAUSE_SECONDS", "5.0"))
 ALWAYS_KEEPALIVE_INTERVAL_SECONDS = float(os.getenv("ALWAYS_KEEPALIVE_INTERVAL_SECONDS", "5.0"))
+COMMAND_DEDUP_WINDOW_SECONDS = float(os.getenv("COMMAND_DEDUP_WINDOW_SECONDS", "1.2"))
+CHAT_MESSAGE_DEDUP_WINDOW_SECONDS = float(os.getenv("CHAT_MESSAGE_DEDUP_WINDOW_SECONDS", "1.2"))
 META_PAUSE_COMMAND = "*pausa"
 MEDIA_OUTPUT_DIR = os.getenv("MEDIA_OUTPUT_DIR", "captures")
 MEDIA_VIDEO_FPS = float(os.getenv("MEDIA_VIDEO_FPS", "20.0"))
@@ -180,7 +206,11 @@ ocr_sender = OCRSender()
 media_capture = DroneMediaCapture(drone_reader)
 
 # CommandExecutor traduce nomi-comando → chiamate SDK djitellopy
-command_executor = CommandExecutor(drone_reader, media_capture=media_capture)
+command_executor = CommandExecutor(
+    drone_reader,
+    media_capture=media_capture,
+    dedupe_window_seconds=COMMAND_DEDUP_WINDOW_SECONDS,
+)
 
 
 # Coda prioritaria: emergency > comandi normali > keepalive/meta-pausa
@@ -191,6 +221,17 @@ QUEUE_LOW_PRIORITY_COMMANDS = {META_PAUSE_COMMAND}
 command_buffer: queue.PriorityQueue[tuple[int, int, str, int | None]] = queue.PriorityQueue(
     maxsize=COMMAND_BUFFER_MAX_SIZE
 )
+
+_chat_dedupe_lock = threading.Lock()
+_last_chat_signature = ""
+_last_chat_ts = 0.0
+
+_RESTART_REQUIRED_CONFIG_KEYS = {
+    "DRONE_IP",
+    "DRONE_PORT",
+    "VIDEO_PORT",
+    "COMMAND_BUFFER_MAX_SIZE",
+}
 
 # Buffer permanente: usato solo quando la coda temporanea e' vuota e il drone e' in volo
 PERMANENT_BUFFER_COMMANDS: list[tuple[str, int | None]] = [
@@ -207,12 +248,182 @@ def _has_pending_emergency() -> bool:
         return command_buffer.queue[0][0] == PRIORITY_EMERGENCY
 
 
+def _normalize_command_key(command_name: str) -> str:
+    """Normalizza un nome comando per confronti di deduplica."""
+    return re.sub(r"[\s\-]+", "_", str(command_name or "").strip().lower())
+
+
+def _is_command_already_buffered(command_name: str, argument: int | None) -> bool:
+    """True se nella coda esiste gia' lo stesso comando+argomento."""
+    target_name = _normalize_command_key(command_name)
+    with command_buffer.mutex:
+        for _, _, queued_name, queued_argument in command_buffer.queue:
+            if _normalize_command_key(queued_name) == target_name and queued_argument == argument:
+                return True
+    return False
+
+
+def _is_duplicate_chat_message(message: str) -> bool:
+    """Deduplica messaggi chat identici in una breve finestra temporale."""
+    if CHAT_MESSAGE_DEDUP_WINDOW_SECONDS <= 0:
+        return False
+
+    normalized = re.sub(r"\s+", " ", str(message or "").strip().lower())
+    if not normalized:
+        return False
+
+    now = time.monotonic()
+
+    global _last_chat_signature, _last_chat_ts
+    with _chat_dedupe_lock:
+        is_duplicate = (
+            normalized == _last_chat_signature
+            and (now - _last_chat_ts) < CHAT_MESSAGE_DEDUP_WINDOW_SECONDS
+        )
+        _last_chat_signature = normalized
+        _last_chat_ts = now
+
+    return is_duplicate
+
+
+def _reload_runtime_config(changed_keys: set[str] | None = None) -> tuple[list[str], list[str]]:
+    """
+    Ricarica .env e applica a caldo le opzioni runtime compatibili.
+
+    Returns:
+        (applied_keys, restart_required_keys)
+    """
+    load_dotenv(override=True)
+
+    global LOG_MAX_ENTRIES
+    global DRONE_WIFI_SSID, WIFI_TIMEOUT
+    global FRAME_WIDTH, FRAME_HEIGHT, JPEG_QUALITY
+    global FRAME_ENABLE_CONTRAST, FRAME_CONTRAST_ALPHA, FRAME_CONTRAST_BETA
+    global TARGET_FPS
+    global OCR_ENABLED, FUNCTIONGEMMA_ENABLED
+    global COMMAND_BUFFER_DELAY_SECONDS, PERMANENT_BUFFER_PAUSE_SECONDS
+    global ALWAYS_KEEPALIVE_INTERVAL_SECONDS
+    global COMMAND_DEDUP_WINDOW_SECONDS, CHAT_MESSAGE_DEDUP_WINDOW_SECONDS
+
+    changed = changed_keys or set()
+
+    LOG_MAX_ENTRIES = _env_int("LOG_MAX_ENTRIES", LOG_MAX_ENTRIES)
+    DRONE_WIFI_SSID = os.getenv("DRONE_WIFI_SSID", DRONE_WIFI_SSID)
+    WIFI_TIMEOUT = _env_int("WIFI_CONNECT_TIMEOUT", WIFI_TIMEOUT)
+
+    FRAME_WIDTH = _env_int("FRAME_WIDTH", FRAME_WIDTH)
+    FRAME_HEIGHT = _env_int("FRAME_HEIGHT", FRAME_HEIGHT)
+    JPEG_QUALITY = _env_int("JPEG_QUALITY", JPEG_QUALITY)
+    FRAME_ENABLE_CONTRAST = _env_bool("ENABLE_CONTRAST", FRAME_ENABLE_CONTRAST)
+    FRAME_CONTRAST_ALPHA = _env_float("CONTRAST_ALPHA", FRAME_CONTRAST_ALPHA)
+    FRAME_CONTRAST_BETA = _env_int("CONTRAST_BETA", FRAME_CONTRAST_BETA)
+    TARGET_FPS = _env_float("TARGET_FPS", TARGET_FPS)
+
+    OCR_ENABLED = _env_bool("OCR_ENABLED", OCR_ENABLED)
+    FUNCTIONGEMMA_ENABLED = _env_bool("FUNCTIONGEMMA_ENABLED", FUNCTIONGEMMA_ENABLED)
+
+    COMMAND_BUFFER_DELAY_SECONDS = _env_float(
+        "COMMAND_BUFFER_DELAY_SECONDS",
+        COMMAND_BUFFER_DELAY_SECONDS,
+    )
+    PERMANENT_BUFFER_PAUSE_SECONDS = _env_float(
+        "PERMANENT_BUFFER_PAUSE_SECONDS",
+        PERMANENT_BUFFER_PAUSE_SECONDS,
+    )
+    ALWAYS_KEEPALIVE_INTERVAL_SECONDS = _env_float(
+        "ALWAYS_KEEPALIVE_INTERVAL_SECONDS",
+        ALWAYS_KEEPALIVE_INTERVAL_SECONDS,
+    )
+    COMMAND_DEDUP_WINDOW_SECONDS = _env_float(
+        "COMMAND_DEDUP_WINDOW_SECONDS",
+        COMMAND_DEDUP_WINDOW_SECONDS,
+    )
+    CHAT_MESSAGE_DEDUP_WINDOW_SECONDS = _env_float(
+        "CHAT_MESSAGE_DEDUP_WINDOW_SECONDS",
+        CHAT_MESSAGE_DEDUP_WINDOW_SECONDS,
+    )
+
+    frame_processor.update_config(
+        width=FRAME_WIDTH,
+        height=FRAME_HEIGHT,
+        jpeg_quality=JPEG_QUALITY,
+        enable_contrast=FRAME_ENABLE_CONTRAST,
+        contrast_alpha=FRAME_CONTRAST_ALPHA,
+        contrast_beta=FRAME_CONTRAST_BETA,
+    )
+    ocr_sender.reload_from_env()
+    media_capture.reload_from_env()
+    command_executor.set_dedupe_window_seconds(COMMAND_DEDUP_WINDOW_SECONDS)
+
+    runtime_keys = {
+        "LOG_MAX_ENTRIES",
+        "DRONE_WIFI_SSID",
+        "WIFI_CONNECT_TIMEOUT",
+        "FRAME_WIDTH",
+        "FRAME_HEIGHT",
+        "JPEG_QUALITY",
+        "ENABLE_CONTRAST",
+        "CONTRAST_ALPHA",
+        "CONTRAST_BETA",
+        "TARGET_FPS",
+        "OCR_ENABLED",
+        "FUNCTIONGEMMA_ENABLED",
+        "OCR_SERVER_URL",
+        "OCR_TIMEOUT",
+        "OCR_INTERVAL_SECONDS",
+        "OCR_JPEG_QUALITY",
+        "OCR_MIN_CONFIDENCE",
+        "COMMAND_BUFFER_DELAY_SECONDS",
+        "PERMANENT_BUFFER_PAUSE_SECONDS",
+        "ALWAYS_KEEPALIVE_INTERVAL_SECONDS",
+        "COMMAND_DEDUP_WINDOW_SECONDS",
+        "CHAT_MESSAGE_DEDUP_WINDOW_SECONDS",
+        "MEDIA_OUTPUT_DIR",
+        "MEDIA_VIDEO_FPS",
+        "MEDIA_VIDEO_CODEC",
+        "OLLAMA_URL",
+        "OLLAMA_MODEL",
+        "OLLAMA_FUNCTIONGEMMA_MODEL",
+        "OLLAMA_TIMEOUT",
+        "OLLAMA_TEMPERATURE",
+    }
+
+    applied_keys = sorted(changed.intersection(runtime_keys))
+    restart_required = sorted(changed.intersection(_RESTART_REQUIRED_CONFIG_KEYS))
+    return applied_keys, restart_required
+
+
 def enqueue_executor_commands(commands: list[tuple[str, int | None]], source: str = "ocr") -> int:
     """
     Inserisce in coda tutti i comandi estratti dal modello, preservando l'ordine.
     """
     enqueued = 0
+    batch_seen: set[tuple[str, int | None]] = set()
+
     for command_name, argument in commands:
+        normalized = _normalize_command_key(command_name)
+        dedupe_key = (normalized, argument)
+
+        if dedupe_key in batch_seen:
+            msg = (
+                f"Duplicato batch ignorato ({source}): {normalized} "
+                f"{argument if argument is not None else ''}"
+            ).rstrip()
+            print(f"{ANSI_BUFFER}[app] {msg}{ANSI_RESET}")
+            add_log(msg, "warning")
+            continue
+
+        if _is_command_already_buffered(command_name, argument):
+            msg = (
+                f"Duplicato coda ignorato ({source}): {normalized} "
+                f"{argument if argument is not None else ''}"
+            ).rstrip()
+            print(f"{ANSI_BUFFER}[app] {msg}{ANSI_RESET}")
+            add_log(msg, "warning")
+            continue
+
+        batch_seen.add(dedupe_key)
+
         try:
             priority = command_executor.get_command_priority(
                 command_name,
@@ -349,10 +560,10 @@ def _always_keepalive_loop() -> None:
     E' indipendente da chat, buffer temporaneo o buffer permanente.
     Include logica di riconnessione automatica dopo fallimenti ripetuti.
     """
-    interval = max(2.0, ALWAYS_KEEPALIVE_INTERVAL_SECONDS)
     consecutive_failures = 0
 
     while True:
+        interval = max(2.0, ALWAYS_KEEPALIVE_INTERVAL_SECONDS)
         time.sleep(interval)
 
         with _state_lock:
@@ -646,6 +857,11 @@ def send_message():
     if not message_trimmed:
         return jsonify({"success": False, "message": "Messaggio vuoto"})
 
+    if _is_duplicate_chat_message(message_trimmed):
+        msg = "Messaggio duplicato ravvicinato ignorato"
+        add_log(f"{msg}: {message_trimmed}", "warning")
+        return jsonify({"success": True, "message": msg, "deduplicated": True})
+
     # Stampa in terminale esattamente il testo ricevuto, senza alterarlo.
     print(f"{ANSI_CHAT}[chat] Messaggio ricevuto: {message}{ANSI_RESET}")
     add_log(f"Chat ricevuta: {message}", "user")
@@ -757,14 +973,36 @@ def get_status():
         })
 
 
-@app.route("/api/logs")
+@app.route("/api/logs", methods=["GET", "POST"])
 def get_logs():
     """
     Return all stored log entries.
     Returns JSON: {logs: [...]}
     """
+    if request.method == "POST":
+        action = str(request.args.get("action", "")).strip().lower()
+        if action == "clear":
+            return clear_logs()
+        return jsonify({"success": False, "message": "Azione non supportata"}), 400
+
     with _state_lock:
         return jsonify({"logs": list(app_state["logs"])})
+
+
+@app.route("/api/logs/clear", methods=["POST", "DELETE"])
+def clear_logs():
+    """
+    Svuota completamente il log in memoria lato server.
+    Returns JSON: {success, message}
+    """
+    with _state_lock:
+        cleared_count = len(app_state["logs"])
+        app_state["logs"].clear()
+    return jsonify({
+        "success": True,
+        "message": f"Log server svuotati ({cleared_count})",
+        "cleared": cleared_count,
+    })
 
 
 @app.route("/api/battery")
@@ -808,7 +1046,6 @@ def _frame_generator():
     Generatore MJPEG: lettura frame → elaborazione → yield JPEG.
     Calcolo FPS basato SOLO sui frame effettivamente inviati al client.
     """
-    min_interval = 1.0 / TARGET_FPS
     last_sent = time.perf_counter()
     last_ocr_result_id = 0
     frames_sent = 0
@@ -864,6 +1101,7 @@ def _frame_generator():
                     last_ocr_result_id = current_result_id
 
             # ── Regolazione timing prima di encode/yield ─────────────────────
+            min_interval = 1.0 / max(1.0, TARGET_FPS)
             now = time.perf_counter()
             delta = now - last_sent
             if delta < min_interval:
@@ -957,6 +1195,8 @@ def get_config():
         "CONTRAST_BETA": "Offset contrasto immagine (default: 2)",
         "OCR_ENABLED": "Abilita invio frame a server OCR remoto",
         "FUNCTIONGEMMA_ENABLED": "Abilita interpretazione comandi chat con FunctionGemma (se false, comandi esatti)",
+        "COMMAND_DEDUP_WINDOW_SECONDS": "Finestra anti-duplicato per lo stesso comando eseguito (secondi, 0 = disabilitato)",
+        "CHAT_MESSAGE_DEDUP_WINDOW_SECONDS": "Finestra anti-duplicato per messaggi chat identici consecutivi (secondi, 0 = disabilitato)",
         "OCR_SERVER_URL": "URL base del server RestOCR (es. https://ocr.sitai.duckdns.org)",
         "OCR_TIMEOUT": "Timeout richiesta OCR in secondi (default: 30)",
         "OCR_INTERVAL_SECONDS": "Intervallo minimo tra invii OCR in secondi (min: 1.0)",
@@ -1025,6 +1265,7 @@ def save_config():
         # Create a new content preserving comments and structure
         new_lines = []
         processed_keys = set()
+        changed_keys: set[str] = set()
         
         for line in lines:
             stripped = line.strip()
@@ -1036,8 +1277,12 @@ def save_config():
                 key = stripped.split('=', 1)[0].strip()
                 if key in new_config:
                     # Replace with new value
-                    new_lines.append(f"{key}={new_config[key]}\n")
+                    incoming = str(new_config[key]).strip()
+                    old_value = stripped.split('=', 1)[1].strip()
+                    new_lines.append(f"{key}={incoming}\n")
                     processed_keys.add(key)
+                    if incoming != old_value:
+                        changed_keys.add(key)
                 else:
                     # Keep existing line
                     new_lines.append(line)
@@ -1045,16 +1290,29 @@ def save_config():
         # Add any new keys that were not in the original file
         for key, value in new_config.items():
             if key not in processed_keys:
-                new_lines.append(f"{key}={value}\n")
+                incoming = str(value).strip()
+                new_lines.append(f"{key}={incoming}\n")
+                changed_keys.add(key)
         
         # Write back to .env
         with open(env_file_path, 'w', encoding='utf-8') as f:
             f.writelines(new_lines)
+
+        applied_keys, restart_required = _reload_runtime_config(changed_keys)
+
+        restart_msg = ""
+        if restart_required:
+            restart_msg = (
+                " Riavvio applicazione richiesto per: "
+                + ", ".join(restart_required)
+            )
         
         add_log("Configurazione salvata in .env", "success")
         return jsonify({
             "success": True,
-            "message": "Configurazione salvata. Nota: ricarica la pagina per applicare le modifiche."
+            "message": "Configurazione salvata e applicata a runtime." + restart_msg,
+            "applied_keys": applied_keys,
+            "restart_required_keys": restart_required,
         })
     
     except Exception as exc:
@@ -1101,48 +1359,12 @@ VOSK_MODEL_PATH = os.path.join(os.path.dirname(__file__), "vosk-voice", "model-i
 def _on_voice_transcription(text: str, session_id: int) -> None:
     """
     Callback chiamato quando Vosk produce una trascrizione finale.
-    Il testo viene processato esattamente come un messaggio chat.
+    Il testo viene solo loggato: l'esecuzione del comando passa dal
+    percorso chat (/api/send_message) per evitare duplicazioni.
     """
     print(f"{ANSI_CHAT}[voice] Trascrizione vocale: {text} (sessione: {session_id}){ANSI_RESET}")
     add_log(f"Vocale: {text}", "user")
-    
-    # Processa il testo come un messaggio chat (senza HTTP request)
-    message_trimmed = text.strip()
-    if not message_trimmed:
-        return
-    
-    # Parsing comando e argomento opzionale
-    match = re.match(r"^(.*?)(?:\s+(-?\d+))?$", message_trimmed)
-    if match:
-        direct_command = match.group(1).strip()
-        direct_arg_raw = match.group(2)
-        direct_argument = int(direct_arg_raw) if direct_arg_raw is not None else None
-
-        ok_direct, msg_direct = command_executor.run(direct_command, direct_argument)
-        if ok_direct:
-            add_log(f"Comando vocale eseguito: {msg_direct}", "success")
-            return
-
-        if "Comando sconosciuto" not in msg_direct:
-            add_log(f"Errore comando vocale: {msg_direct}", "error")
-            return
-
-        if not FUNCTIONGEMMA_ENABLED:
-            add_log(f"Comando vocale non riconosciuto: {direct_command}", "warning")
-            return
-
-    # Se FunctionGemma è abilitato, interpreta il comando
-    if FUNCTIONGEMMA_ENABLED:
-        ok_llm, llm_output = call_functiongemma_from_text(message_trimmed)
-        if ok_llm:
-            parsed_commands = parse_model_output_to_executor_commands(llm_output)
-            if parsed_commands:
-                enqueued = enqueue_executor_commands(parsed_commands, source="voice")
-                add_log(f"Comandi vocali in buffer: {enqueued}/{len(parsed_commands)}", "success" if enqueued > 0 else "warning")
-            else:
-                add_log("Nessun comando estratto da input vocale", "warning")
-        else:
-            add_log(f"Errore FunctionGemma (voice): {llm_output}", "error")
+    add_log("Trascrizione vocale inoltrata alla chat UI", "system")
 
 
 def _on_voice_partial(text: str, session_id: int) -> None:

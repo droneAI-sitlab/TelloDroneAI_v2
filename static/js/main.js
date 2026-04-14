@@ -29,6 +29,13 @@ const ui = {
 
     /** ScriptProcessorNode for audio processing */
     audioProcessor: null,
+
+    /** Prevent overlapping /api/send_message calls */
+    isSendingMessage: false,
+
+    /** Lightweight dedupe guard for accidental double-submit */
+    lastSentMessage: "",
+    lastSentAt: 0,
 };
 
 
@@ -236,6 +243,17 @@ async function sendMessage() {
     const message = input.value.trim();
     if (!message) return;
 
+    const now = Date.now();
+    const duplicateWindowMs = 800;
+    if (ui.isSendingMessage) return;
+    if (ui.lastSentMessage === message && (now - ui.lastSentAt) < duplicateWindowMs) {
+        return;
+    }
+
+    ui.isSendingMessage = true;
+    ui.lastSentMessage = message;
+    ui.lastSentAt = now;
+
     input.value = "";   // clear immediately for better UX
 
     try {
@@ -252,6 +270,8 @@ async function sendMessage() {
         // Successful entries are logged server-side and arrive via poll
     } catch (err) {
         addLocalLog("error", "Errore invio messaggio: " + err.message);
+    } finally {
+        ui.isSendingMessage = false;
     }
 }
 
@@ -260,7 +280,10 @@ async function sendMessage() {
  * @param {KeyboardEvent} event
  */
 function handleInputKey(event) {
-    if (event.key === "Enter") sendMessage();
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    if (event.repeat) return;
+    sendMessage();
 }
 
 
@@ -492,11 +515,17 @@ function _buildLogEntry(time, level, message) {
 }
 
 /** Remove all log entries displayed in the UI. */
-function clearLogs() {
+async function clearLogs() {
+    let ok = await _apiPost("/api/logs/clear");
+    if (!ok) {
+        ok = await _apiPost("/api/logs?action=clear");
+    }
+    if (!ok) return;
+
     const box = document.getElementById("log-box");
     box.innerHTML = "";
-    ui.lastLogCount = 0;
-    addLocalLog("system", "Log svuotato");
+    ui.lastLogCount = -1;
+    await _fetchLogs();
 }
 
 
@@ -681,14 +710,24 @@ async function saveSettings() {
         const data = await res.json();
         
         if (data.success) {
-            addLocalLog("success", "✅ Configurazione salvata con successo!");
-            
-            // Ask user if they want to reload
-            if (confirm("Impostazioni salvate. Vuoi ricaricare la pagina per applicare le modifiche?")) {
-                location.reload();
-            } else {
-                closeSettingsModal();
+            const applied = Array.isArray(data.applied_keys) ? data.applied_keys : [];
+            const restartRequired = Array.isArray(data.restart_required_keys)
+                ? data.restart_required_keys
+                : [];
+
+            addLocalLog("success", data.message || "Configurazione salvata");
+
+            if (applied.length > 0) {
+                addLocalLog("system", `Applicate a caldo: ${applied.join(", ")}`);
             }
+
+            if (restartRequired.length > 0) {
+                addLocalLog("warning", `Richiedono riavvio server: ${restartRequired.join(", ")}`);
+            }
+
+            closeSettingsModal();
+            _fetchStatus();
+            _fetchLogs();
         } else {
             addLocalLog("error", data.message || "Errore salvataggio configurazione");
         }
