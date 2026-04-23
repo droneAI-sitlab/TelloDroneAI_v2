@@ -64,6 +64,7 @@ Questa tabella elenca tutti i comandi supportati dal sistema. Quando `FUNCTIONGE
 | Comando (EN) | Alias | Argomento | Descrizione |
 |--------------|-------|-----------|-------------|
 | `send_keepalive` | `keepalive` | - | Invia heartbeat per mantenere la sessione attiva |
+| `send_keepalive_no_response` | `keepalive_no_response`, `keepalive_nr` | - | Invia heartbeat senza attendere risposta SDK |
 | `get_battery` | `battery` | - | Legge la batteria del drone (0-100%) |
 
 ---

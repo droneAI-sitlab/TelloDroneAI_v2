@@ -119,11 +119,11 @@ FUNCTIONGEMMA_ENABLED = _env_bool("FUNCTIONGEMMA_ENABLED", True)
 # ── Buffer comandi da FunctionGemma ───────────────────────────────────
 COMMAND_BUFFER_DELAY_SECONDS = float(os.getenv("COMMAND_BUFFER_DELAY_SECONDS", "2.0"))
 COMMAND_BUFFER_MAX_SIZE = int(os.getenv("COMMAND_BUFFER_MAX_SIZE", "50"))
-PERMANENT_BUFFER_PAUSE_SECONDS = float(os.getenv("PERMANENT_BUFFER_PAUSE_SECONDS", "5.0"))
-ALWAYS_KEEPALIVE_INTERVAL_SECONDS = float(os.getenv("ALWAYS_KEEPALIVE_INTERVAL_SECONDS", "5.0"))
+# Keepalive cooldown timer (nuovo sistema a buffer singolo)
+KEEPALIVE_COOLDOWN_SECONDS = float(os.getenv("KEEPALIVE_COOLDOWN_SECONDS", "5.0"))
+KEEPALIVE_USE_NO_RESPONSE = _env_bool("KEEPALIVE_USE_NO_RESPONSE", False)
 COMMAND_DEDUP_WINDOW_SECONDS = float(os.getenv("COMMAND_DEDUP_WINDOW_SECONDS", "1.2"))
 CHAT_MESSAGE_DEDUP_WINDOW_SECONDS = float(os.getenv("CHAT_MESSAGE_DEDUP_WINDOW_SECONDS", "1.2"))
-META_PAUSE_COMMAND = "*pausa"
 MEDIA_OUTPUT_DIR = os.getenv("MEDIA_OUTPUT_DIR", "captures")
 MEDIA_VIDEO_FPS = float(os.getenv("MEDIA_VIDEO_FPS", "20.0"))
 MEDIA_VIDEO_CODEC = os.getenv("MEDIA_VIDEO_CODEC", "mp4v")
@@ -213,10 +213,11 @@ command_executor = CommandExecutor(
 )
 
 
-# Coda prioritaria: emergency > comandi normali > keepalive/meta-pausa
+# Coda prioritaria: emergency (prio 0) > comandi normali (prio 1) > keepalive (prio 2)
 _command_sequence = itertools.count()
 PRIORITY_EMERGENCY = command_executor.emergency_priority_value()
-QUEUE_LOW_PRIORITY_COMMANDS = {META_PAUSE_COMMAND}
+PRIORITY_NORMAL = command_executor.normal_priority_value()
+PRIORITY_KEEPALIVE = command_executor.keepalive_priority_value()
 
 command_buffer: queue.PriorityQueue[tuple[int, int, str, int | None]] = queue.PriorityQueue(
     maxsize=COMMAND_BUFFER_MAX_SIZE
@@ -232,12 +233,6 @@ _RESTART_REQUIRED_CONFIG_KEYS = {
     "VIDEO_PORT",
     "COMMAND_BUFFER_MAX_SIZE",
 }
-
-# Buffer permanente: usato solo quando la coda temporanea e' vuota e il drone e' in volo
-PERMANENT_BUFFER_COMMANDS: list[tuple[str, int | None]] = [
-    ("send_keepalive", None),
-    (META_PAUSE_COMMAND, None),
-]
 
 
 def _has_pending_emergency() -> bool:
@@ -301,8 +296,7 @@ def _reload_runtime_config(changed_keys: set[str] | None = None) -> tuple[list[s
     global FRAME_ENABLE_CONTRAST, FRAME_CONTRAST_ALPHA, FRAME_CONTRAST_BETA
     global TARGET_FPS
     global OCR_ENABLED, FUNCTIONGEMMA_ENABLED
-    global COMMAND_BUFFER_DELAY_SECONDS, PERMANENT_BUFFER_PAUSE_SECONDS
-    global ALWAYS_KEEPALIVE_INTERVAL_SECONDS
+    global COMMAND_BUFFER_DELAY_SECONDS, KEEPALIVE_COOLDOWN_SECONDS, KEEPALIVE_USE_NO_RESPONSE
     global COMMAND_DEDUP_WINDOW_SECONDS, CHAT_MESSAGE_DEDUP_WINDOW_SECONDS
 
     changed = changed_keys or set()
@@ -326,13 +320,13 @@ def _reload_runtime_config(changed_keys: set[str] | None = None) -> tuple[list[s
         "COMMAND_BUFFER_DELAY_SECONDS",
         COMMAND_BUFFER_DELAY_SECONDS,
     )
-    PERMANENT_BUFFER_PAUSE_SECONDS = _env_float(
-        "PERMANENT_BUFFER_PAUSE_SECONDS",
-        PERMANENT_BUFFER_PAUSE_SECONDS,
+    KEEPALIVE_COOLDOWN_SECONDS = _env_float(
+        "KEEPALIVE_COOLDOWN_SECONDS",
+        KEEPALIVE_COOLDOWN_SECONDS,
     )
-    ALWAYS_KEEPALIVE_INTERVAL_SECONDS = _env_float(
-        "ALWAYS_KEEPALIVE_INTERVAL_SECONDS",
-        ALWAYS_KEEPALIVE_INTERVAL_SECONDS,
+    KEEPALIVE_USE_NO_RESPONSE = _env_bool(
+        "KEEPALIVE_USE_NO_RESPONSE",
+        KEEPALIVE_USE_NO_RESPONSE,
     )
     COMMAND_DEDUP_WINDOW_SECONDS = _env_float(
         "COMMAND_DEDUP_WINDOW_SECONDS",
@@ -374,8 +368,8 @@ def _reload_runtime_config(changed_keys: set[str] | None = None) -> tuple[list[s
         "OCR_JPEG_QUALITY",
         "OCR_MIN_CONFIDENCE",
         "COMMAND_BUFFER_DELAY_SECONDS",
-        "PERMANENT_BUFFER_PAUSE_SECONDS",
-        "ALWAYS_KEEPALIVE_INTERVAL_SECONDS",
+        "KEEPALIVE_COOLDOWN_SECONDS",
+        "KEEPALIVE_USE_NO_RESPONSE",
         "COMMAND_DEDUP_WINDOW_SECONDS",
         "CHAT_MESSAGE_DEDUP_WINDOW_SECONDS",
         "MEDIA_OUTPUT_DIR",
@@ -425,10 +419,7 @@ def enqueue_executor_commands(commands: list[tuple[str, int | None]], source: st
         batch_seen.add(dedupe_key)
 
         try:
-            priority = command_executor.get_command_priority(
-                command_name,
-                keepalive_commands=QUEUE_LOW_PRIORITY_COMMANDS,
-            )
+            priority = command_executor.get_command_priority(command_name)
             sequence = next(_command_sequence)
             command_buffer.put_nowait((priority, sequence, command_name, argument))
             enqueued += 1
@@ -445,179 +436,112 @@ def enqueue_executor_commands(commands: list[tuple[str, int | None]], source: st
     return enqueued
 
 
-def _enqueue_permanent_buffer_if_needed(trigger: str) -> int:
-    """
-    Accoda il buffer permanente solo quando:
-      - stream attivo
-      - drone in volo
-      - coda temporanea vuota
-    """
-    with _state_lock:
-        stream_on = app_state["stream_active"]
-
-    if not stream_on or not command_executor.is_flying() or not command_buffer.empty():
-        return 0
-
-    enqueued = 0
-    for command_name, argument in PERMANENT_BUFFER_COMMANDS:
-        try:
-            priority = command_executor.get_command_priority(
-                command_name,
-                keepalive_commands=QUEUE_LOW_PRIORITY_COMMANDS,
-            )
-            sequence = next(_command_sequence)
-            command_buffer.put_nowait((priority, sequence, command_name, argument))
-            enqueued += 1
-        except queue.Full:
-            break
-
-    if enqueued > 0:
-        msg = f"Buffer permanente accodato ({trigger}): {enqueued}/{len(PERMANENT_BUFFER_COMMANDS)}"
-        print(f"{ANSI_BUFFER}[app] {msg}{ANSI_RESET}")
-        add_log(msg, "system")
-
-    return enqueued
+# Timestamp ultimo keepalive eseguito (per cooldown)
+_last_keepalive_ts = 0.0
+_keepalive_lock = threading.Lock()
 
 
 def _command_buffer_worker() -> None:
     """
-    Worker dedicato: esegue comandi dalla coda con una pausa configurabile tra esecuzioni.
+    Worker dedicato: esegue comandi dalla coda con keepalive dinamico.
+    
+    Nuova logica:
+    - Un solo buffer con priorità 3 livelli (0=emergency, 1=normali, 2=keepalive)
+    - Keepalive viene eseguito solo quando buffer vuoto e cooldown scaduto
+    - Durante cooldown, se arrivano comandi, il timer si resetta
     """
+    global _last_keepalive_ts
+    
     while True:
-        _, _, command_name, argument = command_buffer.get()
-        try:
-            if command_name == "send_keepalive":
-                if not command_executor.is_flying():
-                    ok_cmd, msg_cmd = True, "skip – send_keepalive (drone a terra)"
+        # Controlla se ci sono comandi reali nella coda
+        has_real_commands = not command_buffer.empty()
+        
+        if has_real_commands:
+            # Estrai ed esegui comando dalla coda
+            _, _, command_name, argument = command_buffer.get()
+            try:
+                ok_cmd, msg_cmd = command_executor.run(command_name, argument)
+                if ok_cmd:
+                    print(f"[app] Comando eseguito da buffer: {msg_cmd}")
+                    add_log(f"Eseguito: {msg_cmd}", "success")
                 else:
-                    ok_cmd, msg_cmd = command_executor.run(command_name, argument)
-                    if not ok_cmd:
-                        # Fallback robusto: una query SDK mantiene viva la sessione anche
-                        # sui firmware che non rispondono al comando keepalive.
-                        ok_fallback, msg_fallback = command_executor.run("get_battery", None)
-                        if ok_fallback:
+                    print(f"[app] Errore esecuzione comando da buffer: {msg_cmd}")
+                    add_log(f"Errore esecuzione: {msg_cmd}", "error")
+            except Exception as exc:
+                print(f"[app] Eccezione worker buffer comandi: {exc}")
+                add_log(f"Eccezione worker buffer: {exc}", "error")
+            finally:
+                command_buffer.task_done()
+            
+            # Reset del timer keepalive quando eseguiamo un comando reale
+            with _keepalive_lock:
+                _last_keepalive_ts = 0.0
+            
+            # Delay tra comandi
+            if COMMAND_BUFFER_DELAY_SECONDS > 0:
+                waited = 0.0
+                step = 0.05
+                while waited < COMMAND_BUFFER_DELAY_SECONDS:
+                    if _has_pending_emergency():
+                        break
+                    chunk = min(step, COMMAND_BUFFER_DELAY_SECONDS - waited)
+                    time.sleep(chunk)
+                    waited += chunk
+        else:
+            # Buffer vuoto - controlla se serve keepalive
+            with _state_lock:
+                stream_on = app_state["stream_active"]
+            
+            if not stream_on or not command_executor.is_flying():
+                # Nessun keepalive se stream spento o drone a terra
+                time.sleep(0.1)
+                continue
+            
+            # Controlla cooldown keepalive
+            now = time.monotonic()
+            with _keepalive_lock:
+                elapsed = now - _last_keepalive_ts
+            
+            if elapsed >= KEEPALIVE_COOLDOWN_SECONDS:
+                # Esegui keepalive
+                try:
+                    keepalive_command = (
+                        "send_keepalive_no_response"
+                        if KEEPALIVE_USE_NO_RESPONSE
+                        else "send_keepalive"
+                    )
+                    ok_cmd, msg_cmd = command_executor.run(keepalive_command, None)
+                    if ok_cmd:
+                        print(f"[app] Keepalive eseguito: {msg_cmd}")
+                        add_log("Keepalive eseguito", "system")
+                    else:
+                        print(f"[app] Keepalive fallito: {msg_cmd}")
+                        add_log(f"Keepalive fallito: {msg_cmd}", "warning")
+                        # Fallback get_battery
+                        ok_fb, msg_fb = command_executor.run("get_battery", None)
+                        if ok_fb:
                             battery_level = drone_reader.get_battery()
                             with _state_lock:
                                 app_state["battery"] = battery_level
-                            ok_cmd = True
-                            msg_cmd = (
-                                f"keepalive non confermato ({msg_cmd}); "
-                                f"fallback ok: {msg_fallback}"
-                            )
-                            add_log("Keepalive non confermato: usato fallback get_battery", "warning")
-                        else:
-                            msg_cmd = f"{msg_cmd} | fallback get_battery fallito: {msg_fallback}"
-            elif command_name == META_PAUSE_COMMAND:
-                pause_seconds = max(0.0, PERMANENT_BUFFER_PAUSE_SECONDS)
-                if pause_seconds > 0:
-                    time.sleep(pause_seconds)
-                ok_cmd, msg_cmd = True, f"ok – {META_PAUSE_COMMAND} {pause_seconds:.1f}s"
-                _enqueue_permanent_buffer_if_needed("meta-pausa")
+                            add_log("Keepalive fallback get_battery ok", "system")
+                except Exception as exc:
+                    print(f"[app] Eccezione keepalive: {exc}")
+                    add_log(f"Eccezione keepalive: {exc}", "error")
+                finally:
+                    with _keepalive_lock:
+                        _last_keepalive_ts = time.monotonic()
+                
+                # Attendi il resto del cooldown prima di ricontrollare
+                time.sleep(max(0.0, KEEPALIVE_COOLDOWN_SECONDS - 0.1))
             else:
-                ok_cmd, msg_cmd = command_executor.run(command_name, argument)
-
-            if ok_cmd:
-                print(f"[app] Comando eseguito da buffer: {msg_cmd}")
-                add_log(f"Eseguito: {msg_cmd}", "success")
-            else:
-                print(f"[app] Errore esecuzione comando da buffer: {msg_cmd}")
-                add_log(f"Errore esecuzione: {msg_cmd}", "error")
-        except Exception as exc:
-            print(f"[app] Eccezione worker buffer comandi: {exc}")
-            add_log(f"Eccezione worker buffer: {exc}", "error")
-        finally:
-            command_buffer.task_done()
-
-        # Delay tra un comando e il successivo (la meta pausa gestisce gia il proprio wait)
-        if command_name != META_PAUSE_COMMAND and COMMAND_BUFFER_DELAY_SECONDS > 0:
-            waited = 0.0
-            step = 0.05
-            while waited < COMMAND_BUFFER_DELAY_SECONDS:
-                if _has_pending_emergency():
-                    break
-                chunk = min(step, COMMAND_BUFFER_DELAY_SECONDS - waited)
-                time.sleep(chunk)
-                waited += chunk
-
-        if command_name != META_PAUSE_COMMAND:
-            _enqueue_permanent_buffer_if_needed("worker-empty")
+                # In cooldown, aspetta un po'
+                time.sleep(0.1)
 
 
 threading.Thread(
     target=_command_buffer_worker,
     daemon=True,
     name="command-buffer-worker",
-).start()
-
-
-# Numero massimo di fallimenti consecutivi prima di tentare riconnessione
-KEEPALIVE_MAX_FAILURES = 3
-
-
-def _always_keepalive_loop() -> None:
-    """
-    Keepalive globale quando stream attivo E drone in volo.
-    E' indipendente da chat, buffer temporaneo o buffer permanente.
-    Include logica di riconnessione automatica dopo fallimenti ripetuti.
-    """
-    consecutive_failures = 0
-
-    while True:
-        interval = max(2.0, ALWAYS_KEEPALIVE_INTERVAL_SECONDS)
-        time.sleep(interval)
-
-        with _state_lock:
-            stream_on = app_state["stream_active"]
-        if not stream_on:
-            consecutive_failures = 0  # Reset se stream non attivo
-            continue
-
-        if not command_executor.is_flying():
-            consecutive_failures = 0  # Nessun keepalive se drone a terra
-            continue
-
-        ok_keepalive, msg_keepalive = command_executor.run("send_keepalive", None)
-        if ok_keepalive:
-            consecutive_failures = 0
-            continue
-
-        # Keepalive fallito - incrementa contatore
-        consecutive_failures += 1
-        add_log(f"Keepalive fallito ({consecutive_failures}/{KEEPALIVE_MAX_FAILURES}): {msg_keepalive}", "warning")
-
-        if consecutive_failures >= KEEPALIVE_MAX_FAILURES:
-            add_log(f"Keepalive fallito {consecutive_failures} volte consecutive - tentativo riconnessione", "error")
-            
-            # Tentativo di riconnessione
-            try:
-                media_capture.stop_video_recording_silent()
-                drone_reader.cleanup_connection()
-                time.sleep(1.0)
-                
-                ok_reconnect = drone_reader.start_stream()
-                if ok_reconnect:
-                    add_log("Riconnessione drone riuscita", "success")
-                    with _state_lock:
-                        app_state["battery"] = drone_reader.get_battery()
-                    consecutive_failures = 0
-                else:
-                    add_log("Riconnessione drone fallita - stream disattivato", "error")
-                    with _state_lock:
-                        app_state["stream_active"] = False
-                    command_executor.reset_flight_state()
-                    consecutive_failures = 0
-            except Exception as exc:
-                add_log(f"Errore durante riconnessione: {exc}", "error")
-                with _state_lock:
-                    app_state["stream_active"] = False
-                command_executor.reset_flight_state()
-                consecutive_failures = 0
-
-
-threading.Thread(
-    target=_always_keepalive_loop,
-    daemon=True,
-    name="always-keepalive",
 ).start()
 
 
@@ -877,10 +801,29 @@ def send_message():
         direct_arg_raw = match.group(2)
         direct_argument = int(direct_arg_raw) if direct_arg_raw is not None else None
 
-        ok_direct, msg_direct = command_executor.run(direct_command, direct_argument)
+        ok_direct, msg_direct, canonical_direct, effective_direct_arg = command_executor.validate(
+            direct_command,
+            direct_argument,
+        )
         if ok_direct:
-            add_log(f"Comando diretto chat eseguito: {msg_direct}", "success")
-            return jsonify({"success": True, "message": msg_direct, "direct_command": True})
+            queued_command = canonical_direct or direct_command
+            enqueued = enqueue_executor_commands(
+                [(queued_command, effective_direct_arg)],
+                source="chat-direct",
+            )
+            if enqueued > 0:
+                detail = (
+                    f"{queued_command} {effective_direct_arg}"
+                    if effective_direct_arg is not None
+                    else queued_command
+                )
+                msg = f"Comando diretto accodato: {detail}"
+                add_log(msg, "success")
+                return jsonify({"success": True, "message": msg, "direct_command": True, "queued": True})
+
+            msg = "Buffer comandi pieno: comando diretto non accodato"
+            add_log(msg, "warning")
+            return jsonify({"success": False, "message": msg, "direct_command": True, "queued": True})
 
         if "Comando sconosciuto" not in msg_direct:
             add_log(f"Errore comando diretto chat: {msg_direct}", "error")
@@ -1207,8 +1150,8 @@ def get_config():
         "OLLAMA_TIMEOUT": "Timeout richieste Ollama in secondi (default: 30)",
         "COMMAND_BUFFER_DELAY_SECONDS": "Delay tra comandi eseguiti dal buffer (default: 2.0)",
         "COMMAND_BUFFER_MAX_SIZE": "Dimensione massima coda comandi (default: 50)",
-        "PERMANENT_BUFFER_PAUSE_SECONDS": "Durata meta comando *pausa in secondi (default: 5.0)",
-        "ALWAYS_KEEPALIVE_INTERVAL_SECONDS": "Intervallo keepalive globale in secondi quando stream e drone sono in volo (default: 5.0)",
+        "KEEPALIVE_COOLDOWN_SECONDS": "Cooldown tra keepalive consecutivi quando buffer vuoto (default: 5.0)",
+        "KEEPALIVE_USE_NO_RESPONSE": "Se true usa send_command_without_return('keepalive') invece di attendere risposta 'ok'",
         "MEDIA_OUTPUT_DIR": "Directory dove salvare foto/video (default: captures)",
         "MEDIA_VIDEO_FPS": "FPS di registrazione video (default: 20.0)",
         "MEDIA_VIDEO_CODEC": "Codec FourCC video (default: mp4v)",

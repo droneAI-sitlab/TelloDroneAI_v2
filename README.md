@@ -104,6 +104,8 @@ OLLAMA_TEMPERATURE=0                # 0=deterministico, 1=creativo
 # ─────────────────────────────────────────────────────────────────────
 COMMAND_BUFFER_DELAY_SECONDS=2.0
 COMMAND_BUFFER_MAX_SIZE=50
+KEEPALIVE_COOLDOWN_SECONDS=5.0            # keepalive quando buffer e' vuoto
+KEEPALIVE_USE_NO_RESPONSE=False           # usa send_command_without_return("keepalive")
 
 # ─────────────────────────────────────────────────────────────────────
 # LOGGING - Log in memoria

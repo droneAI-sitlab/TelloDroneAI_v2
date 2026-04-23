@@ -33,6 +33,15 @@ from drone.frame_reader import DroneReader
 from drone.media_capture import DroneMediaCapture
 
 
+def _send_keepalive_without_return(tello, _):
+    """Invia keepalive senza attendere una risposta dal drone."""
+    sender = getattr(tello, "send_command_without_return", None)
+    if sender is None:
+        raise RuntimeError("SDK djitellopy non espone send_command_without_return")
+    sender("keepalive")
+    return None
+
+
 ########################################################################
 #  COSTANTI
 ########################################################################
@@ -51,9 +60,10 @@ _DEFAULT_ANGLE: int = 90   # gradi
 _DEFAULT_SPEED: int = 30   # cm/s
 
 # Priorita' coda comandi (numero minore = precedenza maggiore)
-COMMAND_PRIORITY_EMERGENCY: int = 0
-COMMAND_PRIORITY_NORMAL: int = 10
-COMMAND_PRIORITY_KEEPALIVE: int = 100
+# Nuovo sistema a 3 livelli: 2=emergency(max), 1=normali, 0=keepalive(min)
+COMMAND_PRIORITY_EMERGENCY: int = 0   # priorita' 2 → valore coda 0
+COMMAND_PRIORITY_NORMAL: int = 1      # priorita' 1 → valore coda 1  
+COMMAND_PRIORITY_KEEPALIVE: int = 2   # priorita' 0 → valore coda 2
 
 
 ########################################################################
@@ -180,6 +190,12 @@ COMMAND_TABLE: dict = {
         "unit":    "",
         "desc":    "Invia heartbeat per mantenere la sessione attiva",
     },
+    "send_keepalive_no_response": {
+        "fn":      _send_keepalive_without_return,
+        "default": None,
+        "unit":    "",
+        "desc":    "Invia heartbeat senza attendere risposta SDK",
+    },
     "get_battery": {
         "fn":      lambda t, _: t.get_battery(),
         "default": None,
@@ -236,6 +252,8 @@ _ALIASES: dict = {
     "down":           "move_down",
     "stop":           "emergency",
     "keepalive":      "send_keepalive",
+    "keepalive_no_response": "send_keepalive_no_response",
+    "keepalive_nr":   "send_keepalive_no_response",
     "battery":        "get_battery",
     "foto":           "take_photo",
     "photo":          "take_photo",
@@ -285,7 +303,12 @@ class CommandExecutor:
         self._last_success_signature: Optional[tuple[str, Optional[int]]] = None
         self._last_success_monotonic = 0.0
         self._inflight_signatures: set[tuple[str, Optional[int]]] = set()
-        self._dedupe_exempt_commands = {"send_keepalive", "get_battery", "emergency"}
+        self._dedupe_exempt_commands = {
+            "send_keepalive",
+            "send_keepalive_no_response",
+            "get_battery",
+            "emergency",
+        }
         print(
             "[command_executor] Inizializzato "
             f"(dedupe={self._dedupe_window_seconds:.2f}s)"
@@ -378,6 +401,29 @@ class CommandExecutor:
         log    = f"[command_executor] {canonical} {detail}".strip()
         print(log)
         return True, f"ok – {canonical} {detail}".strip()
+
+    def validate(
+        self,
+        command: str,
+        argument: Optional[int] = None,
+    ) -> tuple[bool, str, Optional[str], Optional[int]]:
+        """
+        Valida comando e argomento senza eseguirli.
+
+        Returns:
+            (True, "ok", canonical, effective_arg) se valido
+            (False, "<errore>", None, None) se non valido
+        """
+        canonical = self._resolve(command)
+        if canonical is None:
+            return False, f"Comando sconosciuto: '{command}'", None, None
+
+        entry = COMMAND_TABLE[canonical]
+        effective_arg = self._resolve_argument(canonical, argument, entry)
+        if isinstance(effective_arg, str):
+            return False, effective_arg, None, None
+
+        return True, "ok", canonical, effective_arg
 
     @staticmethod
     def _resolve_dedupe_window_seconds(explicit_value: Optional[float]) -> float:
@@ -601,8 +647,18 @@ class CommandExecutor:
 
     @staticmethod
     def emergency_priority_value() -> int:
-        """Valore numerico di priorita' per il comando emergency."""
+        """Valore numerico di priorita' per il comando emergency (nuovo sistema: 0)."""
         return COMMAND_PRIORITY_EMERGENCY
+
+    @staticmethod
+    def normal_priority_value() -> int:
+        """Valore numerico di priorita' per comandi normali (nuovo sistema: 1)."""
+        return COMMAND_PRIORITY_NORMAL
+
+    @staticmethod
+    def keepalive_priority_value() -> int:
+        """Valore numerico di priorita' per keepalive (nuovo sistema: 2)."""
+        return COMMAND_PRIORITY_KEEPALIVE
 
     def get_command_priority(
         self,
@@ -610,10 +666,10 @@ class CommandExecutor:
         keepalive_commands: Optional[set[str]] = None,
     ) -> int:
         """
-        Ritorna la priorita' del comando per la coda:
-        - emergency: massima priorita'
-        - keepalive/meta-comandi: minima priorita'
-        - altri: priorita' normale
+        Ritorna la priorita' del comando per la coda (nuovo sistema 3 livelli):
+        - emergency: priorita' 2 → valore coda 0 (massima priorita')
+        - normali: priorita' 1 → valore coda 1
+        - keepalive: priorita' 0 → valore coda 2 (minima priorita')
         """
         normalized = re.sub(r"[\s\-]+", "_", str(command or "").strip().lower())
 
@@ -623,7 +679,7 @@ class CommandExecutor:
         canonical = self._resolve(normalized)
         if canonical == "emergency":
             return COMMAND_PRIORITY_EMERGENCY
-        if canonical == "send_keepalive":
+        if canonical in {"send_keepalive", "send_keepalive_no_response"}:
             return COMMAND_PRIORITY_KEEPALIVE
         return COMMAND_PRIORITY_NORMAL
 
