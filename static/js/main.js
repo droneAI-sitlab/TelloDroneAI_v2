@@ -351,7 +351,7 @@ async function _startVoiceRecognition() {
 
         // Connetti WebSocket al backend Vosk
         const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-        const wsUrl = `${protocol}//${window.location.host}/ws`;
+        const wsUrl = `${protocol}//${window.location.host}/voice/ws`;
         
         ui.voiceSocket = new WebSocket(wsUrl);
 

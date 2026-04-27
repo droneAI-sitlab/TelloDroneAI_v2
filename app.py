@@ -13,16 +13,25 @@ import queue
 import re
 import json
 import itertools
+import zipfile
+import importlib.util
+from pathlib import Path
 
 import cv2
 import numpy as np
 from flask import Flask, Response, jsonify, render_template, request
 from dotenv import load_dotenv
 
-# ── Aggiungi vosk-voice al path per importare voice_module ─────────────
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "vosk-voice"))
+# ── Carica voice_module dalla cartella "vosk-voice" ───────────────────
+_VOICE_MODULE_FILE = os.path.join(os.path.dirname(__file__), "vosk-voice", "voice_module.py")
+_voice_spec = importlib.util.spec_from_file_location("voice_module", _VOICE_MODULE_FILE)
+if _voice_spec is None or _voice_spec.loader is None:
+    raise ImportError(f"Impossibile caricare voice_module da: {_VOICE_MODULE_FILE}")
+_voice_module = importlib.util.module_from_spec(_voice_spec)
+_voice_spec.loader.exec_module(_voice_module)
 
-from voice_module import init_voice_module, voice_bp
+init_voice_module = _voice_module.init_voice_module
+voice_bp = _voice_module.voice_bp
 
 # ── Drone sub-modules ──────────────────────────────────────────────────
 from drone import wifi
@@ -46,6 +55,7 @@ load_dotenv(override=True)
 app = Flask(__name__)
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 app.config["TEMPLATES_AUTO_RELOAD"] = True
+app.register_blueprint(voice_bp, url_prefix="/voice")
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -1295,8 +1305,62 @@ def cleanup():
 #  VOICE MODULE  –  Vosk speech-to-text integration
 ########################################################################
 
-# Percorso al modello Vosk italiano
-VOSK_MODEL_PATH = os.path.join(os.path.dirname(__file__), "vosk-voice", "model-it")
+def _looks_like_vosk_model_dir(path: Path) -> bool:
+    """Ritorna True se la cartella contiene una struttura modello Vosk valida."""
+    return path.is_dir() and (path / "am" / "final.mdl").exists() and (path / "conf" / "mfcc.conf").exists()
+
+
+def _resolve_vosk_model_path() -> str | None:
+    """Trova il modello Vosk locale ed estrae automaticamente lo zip se necessario."""
+    project_root = Path(__file__).resolve().parent
+    vosk_dir = project_root / "vosk-voice"
+
+    if not vosk_dir.exists():
+        return None
+
+    candidates: list[Path] = []
+
+    env_model_path = os.getenv("VOSK_MODEL_PATH", "").strip()
+    if env_model_path:
+        explicit = Path(env_model_path)
+        if not explicit.is_absolute():
+            explicit = project_root / explicit
+        candidates.append(explicit)
+
+    model_it = vosk_dir / "model-it"
+    candidates.append(model_it)
+    candidates.extend(sorted(p for p in vosk_dir.glob("vosk-model-*") if p.is_dir()))
+
+    for candidate in candidates:
+        if _looks_like_vosk_model_dir(candidate):
+            return str(candidate)
+
+    for zip_path in sorted(vosk_dir.glob("vosk-model-*.zip")):
+        try:
+            with zipfile.ZipFile(zip_path, "r") as archive:
+                archive.extractall(vosk_dir)
+            print(f"[app] Modello Vosk estratto da zip: {zip_path}")
+        except Exception as exc:
+            print(f"[app] Errore estrazione zip modello Vosk ({zip_path}): {exc}")
+
+    extracted_candidates = sorted(p for p in vosk_dir.glob("vosk-model-*") if p.is_dir())
+    if not model_it.exists() and extracted_candidates:
+        try:
+            extracted_candidates[0].rename(model_it)
+        except Exception:
+            # Se la rename fallisce, useremo direttamente la cartella estratta.
+            pass
+
+    candidates = [model_it] + extracted_candidates
+    for candidate in candidates:
+        if _looks_like_vosk_model_dir(candidate):
+            return str(candidate)
+
+    return None
+
+
+# Percorso al modello Vosk italiano (con fallback a zip nella cartella vosk-voice)
+VOSK_MODEL_PATH = _resolve_vosk_model_path()
 
 
 def _on_voice_transcription(text: str, session_id: int) -> None:
@@ -1316,19 +1380,19 @@ def _on_voice_partial(text: str, session_id: int) -> None:
 
 
 # Inizializza il modulo vocale se il modello esiste
-if os.path.exists(VOSK_MODEL_PATH):
+if VOSK_MODEL_PATH:
     try:
         init_voice_module(
             app,
             model_path=VOSK_MODEL_PATH,
             on_transcription=_on_voice_transcription,
-            on_partial=_on_voice_partial
+            on_partial=_on_voice_partial,
         )
         print(f"[app] Voice module inizializzato con modello: {VOSK_MODEL_PATH}")
     except Exception as e:
         print(f"[app] Errore inizializzazione voice module: {e}")
 else:
-    print(f"[app] Modello Vosk non trovato in: {VOSK_MODEL_PATH}")
+    print("[app] Modello Vosk non trovato in ./vosk-voice (atteso model-it o zip vosk-model-*.zip)")
 
 
 ########################################################################

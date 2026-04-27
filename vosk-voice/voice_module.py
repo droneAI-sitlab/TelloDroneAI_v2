@@ -11,9 +11,14 @@ Utilizzo:
 """
 
 import json
+import os
+import re
+import threading
+import time
 from vosk import Model, KaldiRecognizer
 from flask_sock import Sock
 from flask import Blueprint, jsonify
+from dotenv import load_dotenv
 
 # Blueprint per le rotte vocali
 voice_bp = Blueprint('voice', __name__)
@@ -23,9 +28,133 @@ _vosk_model = None
 _sock = None
 _on_transcription_callback = None
 _on_partial_callback = None
+_min_final_chars = 4
+_min_avg_confidence = 0.7
+_dedupe_window_seconds = 2.0
+_require_wake_word = False
+_wake_word = "drone"
+_recent_finals = {}
+_recent_lock = threading.Lock()
 
 
-def init_voice_module(app, model_path="model-it", on_transcription=None, on_partial=None):
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip().lower())
+
+
+def _compute_avg_confidence(result_payload: dict) -> float:
+    words = result_payload.get("result")
+    if not isinstance(words, list) or not words:
+        # Se Vosk non fornisce confidenza, non blocchiamo il comando.
+        return 1.0
+
+    conf_values = []
+    for item in words:
+        if isinstance(item, dict):
+            conf = item.get("conf")
+            if isinstance(conf, (int, float)):
+                conf_values.append(float(conf))
+
+    if not conf_values:
+        return 1.0
+    return sum(conf_values) / len(conf_values)
+
+
+def _extract_command_from_wake_word(text: str) -> str:
+    normalized = _normalize_text(text)
+    wake = _normalize_text(_wake_word)
+
+    if not wake:
+        return normalized
+
+    match = re.search(rf"\b{re.escape(wake)}\b", normalized)
+    if not match:
+        return ""
+
+    command = normalized[match.end():].strip(" ,.!?;:")
+    return command
+
+
+def _is_duplicate_final(text: str, session_id: int) -> bool:
+    if _dedupe_window_seconds <= 0:
+        return False
+
+    now = time.monotonic()
+    key = (session_id, _normalize_text(text))
+    with _recent_lock:
+        last_ts = _recent_finals.get(key)
+        if last_ts is not None and (now - last_ts) < _dedupe_window_seconds:
+            return True
+
+        _recent_finals[key] = now
+
+        # Mantieni la struttura piccola eliminando vecchi record.
+        cutoff = now - (_dedupe_window_seconds * 2)
+        stale_keys = [k for k, ts in _recent_finals.items() if ts < cutoff]
+        for stale_key in stale_keys:
+            _recent_finals.pop(stale_key, None)
+
+    return False
+
+
+def _filter_final_text(text: str, result_payload: dict, session_id: int) -> tuple[bool, str, float]:
+    candidate = _normalize_text(text)
+
+    if _require_wake_word:
+        candidate = _extract_command_from_wake_word(candidate)
+        if not candidate:
+            return False, "wake-word assente", 0.0
+
+    if len(candidate) < _min_final_chars:
+        return False, "testo troppo corto", 0.0
+
+    avg_conf = _compute_avg_confidence(result_payload)
+    if avg_conf < _min_avg_confidence:
+        return False, f"conf bassa ({avg_conf:.2f})", avg_conf
+
+    if _is_duplicate_final(candidate, session_id):
+        return False, "duplicato ravvicinato", avg_conf
+
+    return True, candidate, avg_conf
+
+
+def init_voice_module(
+    app,
+    model_path="model-it",
+    on_transcription=None,
+    on_partial=None,
+    min_final_chars=None,
+    min_avg_confidence=None,
+    dedupe_window_seconds=None,
+    require_wake_word=None,
+    wake_word=None,
+):
     """
     Inizializza il modulo vocale.
     
@@ -43,10 +172,32 @@ def init_voice_module(app, model_path="model-it", on_transcription=None, on_part
         init_voice_module(app, "model-it", on_transcription=handle_text)
     """
     global _vosk_model, _sock, _on_transcription_callback, _on_partial_callback
+    global _min_final_chars, _min_avg_confidence, _dedupe_window_seconds
+    global _require_wake_word, _wake_word
+
+    # Carica .env se presente (utile anche in uso standalone del modulo)
+    load_dotenv(override=False)
+
+    env_min_final_chars = _env_int("VOICE_MIN_FINAL_CHARS", 4)
+    env_min_avg_confidence = _env_float("VOICE_MIN_AVG_CONFIDENCE", 0.7)
+    env_dedupe_window = _env_float("VOICE_DEDUPE_WINDOW_SECONDS", 2.0)
+    env_require_wake_word = _env_bool("VOICE_REQUIRE_WAKE_WORD", True)
+    env_wake_word = str(os.getenv("VOICE_WAKE_WORD", "drone")).strip().lower() or "drone"
     
     # Salva i callback
     _on_transcription_callback = on_transcription
     _on_partial_callback = on_partial
+    _min_final_chars = max(1, int(env_min_final_chars if min_final_chars is None else min_final_chars))
+    _min_avg_confidence = max(
+        0.0,
+        min(1.0, float(env_min_avg_confidence if min_avg_confidence is None else min_avg_confidence)),
+    )
+    _dedupe_window_seconds = max(
+        0.0,
+        float(env_dedupe_window if dedupe_window_seconds is None else dedupe_window_seconds),
+    )
+    _require_wake_word = bool(env_require_wake_word if require_wake_word is None else require_wake_word)
+    _wake_word = str(env_wake_word if wake_word is None else wake_word).strip().lower() or "drone"
     
     # Carica il modello Vosk
     print(f"[VoiceModule] Caricamento modello da: {model_path}")
@@ -61,11 +212,18 @@ def init_voice_module(app, model_path="model-it", on_transcription=None, on_part
     _sock = Sock(app)
     
     # Registra la rotta WebSocket
-    @_sock.route("/ws")
+    @_sock.route("/voice/ws")
     def _handle_voice_websocket(ws):
         return _voice_websocket_handler(ws)
     
-    print("[VoiceModule] Inizializzato. Endpoint WebSocket: /ws")
+    print("[VoiceModule] Inizializzato. Endpoint WebSocket: /voice/ws")
+    print(
+        "[VoiceModule] Filtri attivi: "
+        f"min_chars={_min_final_chars}, "
+        f"min_conf={_min_avg_confidence:.2f}, "
+        f"dedupe={_dedupe_window_seconds:.2f}s, "
+        f"wake_word={'on' if _require_wake_word else 'off'}"
+    )
 
 
 def _voice_websocket_handler(ws):
@@ -77,6 +235,7 @@ def _voice_websocket_handler(ws):
     
     # Crea un nuovo recognizer per questa sessione
     rec = KaldiRecognizer(_vosk_model, 16000)
+    rec.SetWords(True)
     session_id = id(ws)
     print(f"[VoiceModule] Nuova sessione: {session_id}")
     
@@ -96,7 +255,19 @@ def _voice_websocket_handler(ws):
                 result = json.loads(rec.Result())
                 text = result.get('text', '').strip()
                 if text:
-                    print(f"[VoiceModule] Sessione {session_id} - FINALE: {text}")
+                    accepted, payload_or_reason, avg_conf = _filter_final_text(text, result, session_id)
+                    if not accepted:
+                        print(
+                            f"[VoiceModule] Sessione {session_id} - FINALE scartato: "
+                            f"{payload_or_reason} | testo='{text}'"
+                        )
+                        continue
+
+                    text = payload_or_reason
+                    print(
+                        f"[VoiceModule] Sessione {session_id} - FINALE: {text} "
+                        f"(conf={avg_conf:.2f})"
+                    )
                     
                     # Esegui callback se definito
                     if _on_transcription_callback:
@@ -109,7 +280,8 @@ def _voice_websocket_handler(ws):
                     ws.send(json.dumps({
                         "text": text,
                         "is_final": True,
-                        "session_id": session_id
+                        "session_id": session_id,
+                        "avg_confidence": avg_conf
                     }))
             else:
                 # Risultato parziale
