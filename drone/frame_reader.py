@@ -80,6 +80,9 @@ class DroneReader:
             True  – stream avviato
             False – errore
         """
+        # Prima di una nuova sessione libera sempre eventuali socket/stream pendenti.
+        self.cleanup_connection()
+
         try:
             # Crea un'istanza Tello fresca ad ogni avvio stream
             self._tello = Tello(host=self._host)
@@ -111,6 +114,7 @@ class DroneReader:
             print(f"[frame_reader] Errore start_stream(): {exc}")
             with self._lock:
                 self._stream_ready = False
+            self.cleanup_connection()
             return False
 
     # ----------------------------------------------------------------
@@ -196,14 +200,7 @@ class DroneReader:
         Ferma lo stream e chiude la connessione al drone.
         Sicuro da chiamare in qualsiasi stato.
         """
-        self.stop_stream()
-
-        if self._tello is not None:
-            try:
-                self._tello.end()
-            except Exception:
-                pass
-
+        self.cleanup_connection()
         print("[frame_reader] Disconnesso")
 
     # ----------------------------------------------------------------

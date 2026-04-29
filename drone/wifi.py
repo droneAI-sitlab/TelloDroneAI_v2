@@ -250,3 +250,55 @@ def connect(ssid: str, timeout: int = 15) -> bool:
     except Exception as exc:
         print(f"[wifi] Errore durante connect: {exc}")
         return False
+
+
+def disconnect(target_ssid: str | None = None, timeout: int = 8) -> bool:
+    """
+    Disconnette l'adattatore WiFi dalla rete corrente.
+
+    Args:
+        target_ssid: se valorizzato, disconnette solo se connessi a quell'SSID.
+        timeout: secondi massimi per confermare il distacco.
+
+    Returns:
+        True se la disconnessione risulta completata o non necessaria.
+    """
+    if not _is_windows():
+        print("[wifi] Disconnessione automatica supportata solo su Windows")
+        return False
+
+    current = get_current_ssid()
+    if target_ssid and current != target_ssid:
+        print(
+            "[wifi] Nessuna disconnessione necessaria "
+            f"(SSID corrente: '{current}', target: '{target_ssid}')"
+        )
+        return True
+
+    interface = _get_wifi_interface()
+
+    try:
+        cmd = ["netsh", "wlan", "disconnect"]
+        if interface:
+            cmd.append(f"interface={interface}")
+
+        result = _run(cmd)
+        out = result.stdout.strip() or result.stderr.strip() or "(nessun output)"
+        print(f"[wifi] netsh disconnect: {out}")
+
+        deadline = time.time() + max(1, timeout)
+        while time.time() < deadline:
+            current = get_current_ssid()
+            if current is None:
+                return True
+            if target_ssid is not None and current != target_ssid:
+                return True
+            time.sleep(0.3)
+
+        current = get_current_ssid()
+        print(f"[wifi] Timeout disconnessione ({timeout}s) - SSID corrente: '{current}'")
+        return False
+
+    except Exception as exc:
+        print(f"[wifi] Errore durante disconnect: {exc}")
+        return False

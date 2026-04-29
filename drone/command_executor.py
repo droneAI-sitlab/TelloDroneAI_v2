@@ -573,6 +573,19 @@ class CommandExecutor:
         with self._state_lock:
             self._is_flying = False
 
+    def reset_runtime_state(self) -> None:
+        """
+        Reset completo dello stato runtime dopo disconnessioni hard.
+
+        Azzera sia lo stato volo sia la cache anti-duplicato, cosi una nuova
+        sessione non eredita segnature del ciclo precedente.
+        """
+        self.reset_flight_state()
+        with self._dedupe_lock:
+            self._inflight_signatures.clear()
+            self._last_success_signature = None
+            self._last_success_monotonic = 0.0
+
     def run_from_text(self, text: str) -> Tuple[bool, str]:
         """
         Estrae il comando da una stringa OCR libera e lo esegue.

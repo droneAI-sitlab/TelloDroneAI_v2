@@ -5,6 +5,7 @@
 ########################################################################
 """
 import os
+import atexit
 import sys
 import datetime
 import threading
@@ -236,6 +237,9 @@ command_buffer: queue.PriorityQueue[tuple[int, int, str, int | None]] = queue.Pr
 _chat_dedupe_lock = threading.Lock()
 _last_chat_signature = ""
 _last_chat_ts = 0.0
+_teardown_lock = threading.Lock()
+_shutdown_lock = threading.Lock()
+_shutdown_done = False
 
 _RESTART_REQUIRED_CONFIG_KEYS = {
     "DRONE_IP",
@@ -395,6 +399,85 @@ def _reload_runtime_config(changed_keys: set[str] | None = None) -> tuple[list[s
     applied_keys = sorted(changed.intersection(runtime_keys))
     restart_required = sorted(changed.intersection(_RESTART_REQUIRED_CONFIG_KEYS))
     return applied_keys, restart_required
+
+
+def _drain_command_buffer() -> int:
+    """Svuota la coda comandi e ritorna quanti elementi sono stati rimossi."""
+    drained = 0
+    while True:
+        try:
+            command_buffer.get_nowait()
+        except queue.Empty:
+            break
+        else:
+            command_buffer.task_done()
+            drained += 1
+    return drained
+
+
+def _hard_disconnect_drone(
+    reason: str,
+    *,
+    disconnect_wifi: bool = False,
+    force_wifi_state: bool | None = None,
+    log_level: str = "warning",
+) -> bool:
+    """
+    Cleanup centralizzato e aggressivo di tutte le risorse drone.
+
+    - stop stream/video recording
+    - chiusura connessione SDK
+    - reset stato executor
+    - svuotamento coda comandi
+    - reset keepalive timer
+    - opzionale disconnessione WiFi OS-level
+    """
+    global _last_keepalive_ts
+
+    with _teardown_lock:
+        media_capture.stop_video_recording_silent()
+        drone_reader.cleanup_connection()
+        command_executor.reset_runtime_state()
+        drained = _drain_command_buffer()
+
+        with _keepalive_lock:
+            _last_keepalive_ts = 0.0
+
+        wifi_ok = True
+        if disconnect_wifi:
+            wifi_ok = wifi.disconnect(target_ssid=DRONE_WIFI_SSID)
+
+        with _state_lock:
+            app_state["stream_active"] = False
+            app_state["battery"] = 0
+            app_state["fps"] = 0.0
+            if force_wifi_state is not None:
+                app_state["wifi_connected"] = force_wifi_state
+            elif disconnect_wifi:
+                app_state["wifi_connected"] = False
+
+    add_log(f"{reason} (cleanup completo, coda svuotata: {drained})", log_level)
+    return wifi_ok
+
+
+def _shutdown_cleanup(reason: str = "Chiusura applicazione") -> None:
+    """Esegue cleanup una sola volta quando il processo termina."""
+    global _shutdown_done
+
+    with _shutdown_lock:
+        if _shutdown_done:
+            return
+        _shutdown_done = True
+
+    try:
+        _hard_disconnect_drone(
+            reason,
+            disconnect_wifi=True,
+            force_wifi_state=False,
+            log_level="system",
+        )
+    except Exception as exc:
+        print(f"[app] Errore cleanup shutdown: {exc}")
 
 
 def enqueue_executor_commands(commands: list[tuple[str, int | None]], source: str = "ocr") -> int:
@@ -578,6 +661,39 @@ threading.Thread(
 ).start()
 
 
+def _wifi_watchdog_loop() -> None:
+    """
+    Verifica periodicamente che il PC sia ancora sulla rete del drone.
+    Se il WiFi cade, forza teardown per evitare sessioni stream corrotte.
+    """
+    while True:
+        time.sleep(2)
+
+        with _state_lock:
+            wifi_expected = app_state["wifi_connected"]
+            stream_on = app_state["stream_active"]
+
+        if not wifi_expected and not stream_on:
+            continue
+
+        if wifi.is_connected_to(DRONE_WIFI_SSID):
+            continue
+
+        _hard_disconnect_drone(
+            "WiFi drone perso: connessioni e stream liberati",
+            disconnect_wifi=False,
+            force_wifi_state=False,
+            log_level="warning",
+        )
+
+
+threading.Thread(
+    target=_wifi_watchdog_loop,
+    daemon=True,
+    name="wifi-watchdog",
+).start()
+
+
 ########################################################################
 #  ROUTE – Main page
 ########################################################################
@@ -602,16 +718,28 @@ def toggle_wifi():
         currently_on = app_state["wifi_connected"]
 
     if currently_on:
-        # ── Disconnetti: cleanup completo, poi WiFi ──────────────────
-        media_capture.stop_video_recording_silent()
-        drone_reader.cleanup_connection()
-        command_executor.reset_flight_state()
-        with _state_lock:
-            app_state["wifi_connected"] = False
-            app_state["stream_active"]  = False
-            app_state["battery"]        = 0
-        add_log("WiFi disconnesso", "warning")
-        return jsonify({"success": True, "connected": False, "message": "WiFi disconnesso"})
+        wifi_ok = _hard_disconnect_drone(
+            "Disconnessione WiFi richiesta",
+            disconnect_wifi=True,
+            force_wifi_state=False,
+            log_level="warning",
+        )
+        msg = "WiFi disconnesso e comunicazioni drone liberate"
+        if not wifi_ok:
+            msg += " (disconnessione WiFi non confermata)"
+        return jsonify({
+            "success": True,
+            "connected": False,
+            "message": msg,
+            "wifi_disconnected": wifi_ok,
+        })
+
+    _hard_disconnect_drone(
+        "Pre-cleanup prima della riconnessione WiFi",
+        disconnect_wifi=False,
+        force_wifi_state=False,
+        log_level="system",
+    )
 
     # ── Connetti WiFi via netsh ────────────────────────────────────────
     add_log(f"Connessione WiFi → {DRONE_WIFI_SSID} …", "info")
@@ -644,14 +772,27 @@ def toggle_stream():
             )
         currently_on = app_state["stream_active"]
 
+    if not wifi.is_connected_to(DRONE_WIFI_SSID):
+        _hard_disconnect_drone(
+            "Stream non avviato: WiFi drone non disponibile",
+            disconnect_wifi=False,
+            force_wifi_state=False,
+            log_level="warning",
+        )
+        return jsonify(
+            {
+                "success": False,
+                "active": False,
+                "message": "WiFi drone non disponibile: riconnetti prima il WiFi",
+            }
+        )
+
     if currently_on:
-        # ── Ferma stream con cleanup completo ──────────────────────────
-        media_capture.stop_video_recording_silent()
-        drone_reader.cleanup_connection()
-        command_executor.reset_flight_state()
-        with _state_lock:
-            app_state["stream_active"] = False
-        add_log("Stream fermato e connessione liberata", "warning")
+        _hard_disconnect_drone(
+            "Stream fermato su richiesta utente",
+            disconnect_wifi=False,
+            log_level="warning",
+        )
         return jsonify({"success": True, "active": False, "message": "Stream fermato"})
 
     # ── Connetti al drone e avvia stream in un’unica operazione ──────────
@@ -661,6 +802,15 @@ def toggle_stream():
         app_state["stream_active"] = ok
         if ok:
             app_state["battery"] = drone_reader.get_battery()
+            app_state["fps"] = 0.0
+
+    if not ok:
+        _hard_disconnect_drone(
+            "Avvio stream fallito: risorse drone rilasciate",
+            disconnect_wifi=False,
+            force_wifi_state=wifi.is_connected_to(DRONE_WIFI_SSID),
+            log_level="error",
+        )
 
     msg = "Stream avviato" if ok else "Avvio stream fallito – verifica connessione WiFi"
     add_log(msg, "success" if ok else "error")
@@ -1003,6 +1153,7 @@ def _frame_generator():
     last_ocr_result_id = 0
     frames_sent = 0
     last_fps_update = time.perf_counter()
+    no_frame_since = 0.0
 
     while True:
         try:
@@ -1016,8 +1167,19 @@ def _frame_generator():
             # ── Cattura frame dal drone ───────────────────────────────────
             frame = drone_reader.get_frame()
             if frame is None:
+                if no_frame_since <= 0.0:
+                    no_frame_since = time.monotonic()
+                elif (time.monotonic() - no_frame_since) > 3.0:
+                    _hard_disconnect_drone(
+                        "Stream senza frame per oltre 3 secondi",
+                        disconnect_wifi=False,
+                        force_wifi_state=wifi.is_connected_to(DRONE_WIFI_SSID),
+                        log_level="error",
+                    )
+                    no_frame_since = 0.0
                 time.sleep(0.01)
                 continue
+            no_frame_since = 0.0
 
             # ── Elaborazione frame: resize, contrasto, AI ─────────────────
             processed = frame_processor.process_to_frame(frame)
@@ -1088,8 +1250,8 @@ def _frame_generator():
                 with _state_lock:
                     app_state["fps"] = fps
 
-        except Exception:
-            # ── Fallback visivo + riavvio stream ──────────────────────────
+        except Exception as exc:
+            # ── Fallback visivo + teardown hard ───────────────────────────
             fallback = np.zeros((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
             cv2.putText(fallback, "Stream non disponibile", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
@@ -1101,13 +1263,14 @@ def _frame_generator():
                     + buffer.tobytes() +
                     b"\r\n"
                 )
-            try:
-                drone_reader.stop_stream()
-                time.sleep(0.3)
-                drone_reader.start_stream()
-            except Exception:
-                pass
-            time.sleep(0.5)
+
+            _hard_disconnect_drone(
+                f"Errore stream MJPEG: {exc}",
+                disconnect_wifi=False,
+                force_wifi_state=wifi.is_connected_to(DRONE_WIFI_SSID),
+                log_level="error",
+            )
+            time.sleep(0.3)
 
 
 ########################################################################
@@ -1287,14 +1450,29 @@ def cleanup():
     Returns JSON: {success, message}
     """
     try:
-        media_capture.stop_video_recording_silent()
-        drone_reader.cleanup_connection()
-        command_executor.reset_flight_state()
-        with _state_lock:
-            app_state["stream_active"] = False
-            app_state["battery"]        = 0
-        add_log("Cleanup connessioni drone completato", "system")
-        return jsonify({"success": True, "message": "Drone disconnesso e liberato"})
+        data = request.get_json(silent=True) or {}
+        disconnect_wifi = bool(data.get("disconnect_wifi", False))
+
+        wifi_ok = _hard_disconnect_drone(
+            "Cleanup connessioni drone completato",
+            disconnect_wifi=disconnect_wifi,
+            force_wifi_state=False if disconnect_wifi else None,
+            log_level="system",
+        )
+
+        message = "Drone disconnesso e liberato"
+        if disconnect_wifi:
+            message = (
+                "Drone disconnesso e WiFi liberato"
+                if wifi_ok
+                else "Drone disconnesso (disconnessione WiFi non confermata)"
+            )
+
+        return jsonify({
+            "success": True,
+            "message": message,
+            "wifi_disconnected": wifi_ok if disconnect_wifi else None,
+        })
     except Exception as exc:
         error_msg = f"Errore cleanup: {str(exc)}"
         add_log(error_msg, "error")
@@ -1393,6 +1571,16 @@ if VOSK_MODEL_PATH:
         print(f"[app] Errore inizializzazione voice module: {e}")
 else:
     print("[app] Modello Vosk non trovato in ./vosk-voice (atteso model-it o zip vosk-model-*.zip)")
+
+
+def _register_shutdown_hooks() -> None:
+    """Registra cleanup all'uscita evitando il processo parent del reloader Flask."""
+    if FLASK_DEBUG and os.getenv("WERKZEUG_RUN_MAIN") != "true":
+        return
+    atexit.register(_shutdown_cleanup)
+
+
+_register_shutdown_hooks()
 
 
 ########################################################################
