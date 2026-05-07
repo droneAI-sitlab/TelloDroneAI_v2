@@ -15,6 +15,12 @@ const ui = {
     /** Number of log entries already rendered (avoids full re-render) */
     lastLogCount: 0,
 
+    /** Modalità di controllo tastiera (WASD + Spazio + Shift) */
+    keyboardMode: false,
+
+    /** Evita spam di comandi dal controller tastiera */
+    isSendingCommand: false,
+
     /** Whether the microphone is currently recording */
     isRecording: false,
 
@@ -184,6 +190,17 @@ function _setToggle(name, active) {
     }
 }
 
+/**
+ * Remove il focus dal toggle dopo il cambio di stato.
+ * Serve a evitare che il tasto spazio o altri input continuino a colpire lo switch.
+ * @param {HTMLInputElement} checkbox
+ */
+function _blurToggle(checkbox) {
+    if (checkbox && typeof checkbox.blur === "function") {
+        checkbox.blur();
+    }
+}
+
 
 // ================================================================
 //  CONTROL HANDLERS  –  called by onchange of each toggle input
@@ -197,10 +214,12 @@ async function toggleWifi(checkbox) {
     const ok = await _apiPost("/api/toggle_wifi");
     if (!ok) {
         checkbox.checked = !checkbox.checked; // revert on failure
+        _blurToggle(checkbox);
         return;
     }
     _setToggle("wifi", ok.connected);
     addLocalLog(ok.connected ? "success" : "warning", ok.message);
+    _blurToggle(checkbox);
 }
 
 /**
@@ -211,6 +230,7 @@ async function toggleStream(checkbox) {
     const ok = await _apiPost("/api/toggle_stream");
     if (!ok) {
         checkbox.checked = !checkbox.checked;
+        _blurToggle(checkbox);
         return;
     }
     _setToggle("stream", ok.active);
@@ -230,7 +250,156 @@ async function toggleStream(checkbox) {
         feed.style.display    = "none";
         placeholder.style.display = "flex";
     }
+
+    _blurToggle(checkbox);
 }
+
+/**
+ * Toggle Keyboard Mode (WASD + Space + Shift)
+ */
+async function toggleKeyboardMode(checkbox) {
+    ui.keyboardMode = checkbox.checked;
+    const status = document.getElementById("keyboard-status");
+    if (status) {
+        status.textContent = ui.keyboardMode ? "ON" : "OFF";
+        status.classList.toggle("on", ui.keyboardMode);
+    }
+    
+    // Comunica al backend di stoppare il keepalive
+    try {
+        await fetch("/api/toggle_keyboard", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ active: ui.keyboardMode })
+        });
+    } catch(err) {
+        console.error("Errore notifica keyboard mode", err);
+    }
+    
+    // Invia RC (0,0,0,0) per sicurezza se disattiviamo
+    if (!ui.keyboardMode) {
+        sendRCControl(0, 0, 0, 0);
+        activeKeys = {}; // Resetta stato tasti
+    }
+    
+    addLocalLog("system", ui.keyboardMode ? "Modalità di controllo RC da tastiera ATTIVATA" : "Modalità di controllo RC da tastiera DISATTIVATA");
+    _blurToggle(checkbox);
+}
+
+let activeKeys = {};
+let lastRC = { lr: 0, fb: 0, ud: 0, yaw: 0 };
+let lastKeyTimes = {}; // Per i double click
+
+async function sendDiscreteCommand(command) {
+    try {
+        const res = await fetch("/api/command", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ command: command })
+        });
+        const data = await res.json();
+        if (data.success) {
+            addLocalLog("success", `RC Discreto eseguito: ${command}`);
+        } else {
+            addLocalLog("error", `Errore comando RC: ${data.message}`);
+        }
+    } catch (err) {
+        console.error("Errore invio comando discreto", err);
+    }
+}
+
+async function sendRCControl(lr, fb, ud, yaw) {
+    if (lastRC.lr === lr && lastRC.fb === fb && lastRC.ud === ud && lastRC.yaw === yaw) return;
+    lastRC = { lr, fb, ud, yaw };
+    try {
+        await fetch("/api/rc", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ lr, fb, ud, yaw })
+        });
+    } catch (err) {
+        console.error("Errore invio rc control", err);
+    }
+}
+
+function calcAndSendRC() {
+    if (!ui.keyboardMode) return;
+    const speed = 50; // 50% della velocità massima
+    let lr = 0, fb = 0, ud = 0, yaw = 0;
+    
+    if (activeKeys["w"]) fb += speed;
+    if (activeKeys["s"]) fb -= speed;
+    if (activeKeys["a"]) lr -= speed;
+    if (activeKeys["d"]) lr += speed;
+    if (activeKeys[" "]) ud += speed;
+    if (activeKeys["shift"]) ud -= speed;
+    if (activeKeys["1"]) yaw -= speed; // Antiorario
+    if (activeKeys["2"]) yaw += speed; // Orario
+    
+    sendRCControl(lr, fb, ud, yaw);
+}
+
+// Global keydown event to intercept WASD + Space + Shift when keyboard mode is active
+document.addEventListener("keydown", (event) => {
+    if (!ui.keyboardMode) return;
+    
+    const activeElement = document.activeElement;
+    if (activeElement && (activeElement.tagName === "INPUT" || activeElement.tagName === "TEXTAREA")) return;
+
+    if (event.repeat) return; // Prevent spamming
+    
+    const key = event.key.toLowerCase();
+    
+    // Commandi discreti (Double Click, Emergenza & Flip)
+    const now = Date.now();
+    if (key === "0") {
+        sendDiscreteCommand("emergency");
+        addLocalLog("warning", "RC: Invio comando di EMERGENZA (0)");
+        return;
+    } else if (key === "v") {
+        // Se sta premendo W A S D assieme a V
+        if (activeKeys["w"]) { sendDiscreteCommand("flip_forward"); addLocalLog("info", "RC: Flip in avanti"); }
+        else if (activeKeys["s"]) { sendDiscreteCommand("flip_back"); addLocalLog("info", "RC: Flip indietro"); }
+        else if (activeKeys["a"]) { sendDiscreteCommand("flip_left"); addLocalLog("info", "RC: Flip a sinistra"); }
+        else if (activeKeys["d"]) { sendDiscreteCommand("flip_right"); addLocalLog("info", "RC: Flip a destra"); }
+        else { addLocalLog("warning", "RC: Tieni premuto W, A, S o D insieme a V per fare un flip"); }
+        return;
+    } else if (key === "q") {
+        sendDiscreteCommand("take_photo");
+        addLocalLog("info", "RC: Foto richiesta (Q)");
+        return;
+    } else if (key === " ") {
+        if (lastKeyTimes[" "] && now - lastKeyTimes[" "] < 400) {
+            sendDiscreteCommand("takeoff");
+            lastKeyTimes[" "] = 0;
+        } else {
+            lastKeyTimes[" "] = now;
+        }
+    } else if (key === "shift") {
+        if (lastKeyTimes["shift"] && now - lastKeyTimes["shift"] < 400) {
+            sendDiscreteCommand("land");
+            lastKeyTimes["shift"] = 0;
+        } else {
+            lastKeyTimes["shift"] = now;
+        }
+    }
+    
+    if (["w", "s", "a", "d", " ", "shift", "1", "2"].includes(key)) {
+        if (key === " ") event.preventDefault(); // prevent page scroll
+        activeKeys[key] = true;
+        calcAndSendRC();
+    }
+});
+
+document.addEventListener("keyup", (event) => {
+    if (!ui.keyboardMode) return;
+    
+    const key = event.key.toLowerCase();
+    if (["w", "s", "a", "d", " ", "shift", "1", "2"].includes(key)) {
+        activeKeys[key] = false;
+        calcAndSendRC();
+    }
+});
 
 
 // ================================================================

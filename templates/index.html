@@ -114,6 +114,22 @@
                 <span class="toggle-item__status" id="stream-status">OFF</span>
             </div>
 
+            <!-- Keyboard Mode toggle -->
+            <div class="toggle-item">
+                <span class="toggle-item__label">
+                    <i class="fas fa-keyboard"></i> Tastiera
+                </span>
+                <label class="toggle-switch">
+                    <input
+                        type="checkbox"
+                        id="keyboard-toggle"
+                        onchange="toggleKeyboardMode(this)"
+                    />
+                    <span class="toggle-switch__slider"></span>
+                </label>
+                <span class="toggle-item__status" id="keyboard-status">OFF</span>
+            </div>
+
         </div>
         <!-- /controls-bar -->
 

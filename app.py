@@ -156,6 +156,7 @@ _state_lock = threading.Lock()
 app_state: dict = {
     "wifi_connected": False,
     "stream_active":  False,
+    "keyboard_mode":  False,   # True se lo switch Tastiera RC è attivo
     "battery":        0,       # 0-100 %
     "logs":           [],
     "fps":            0.0,     # FPS in tempo reale
@@ -584,9 +585,11 @@ def _command_buffer_worker() -> None:
             # Buffer vuoto - controlla se serve keepalive
             with _state_lock:
                 stream_on = app_state["stream_active"]
+                keyboard_mode = app_state.get("keyboard_mode", False)
             
-            if not stream_on or not command_executor.is_flying():
-                # Nessun keepalive se stream spento o drone a terra
+            # Non inviare keepalive automatico in modalità RC (Tastiera), i comandi continui bastano
+            # e potrebbero interferire coi comandi inviati manualmente in burst
+            if not stream_on or not command_executor.is_flying() or keyboard_mode:
                 time.sleep(0.1)
                 continue
             
@@ -757,6 +760,16 @@ def toggle_wifi():
     return jsonify({"success": True, "connected": True, "message": f"WiFi connesso a {DRONE_WIFI_SSID}"})
 
 
+@app.route("/api/toggle_keyboard", methods=["POST"])
+def toggle_keyboard():
+    """Aggiorna lo stato della modalità testiera RC in backend, per spegnere il keepalive."""
+    data = request.get_json(silent=True) or {}
+    active = bool(data.get("active", False))
+    with _state_lock:
+        app_state["keyboard_mode"] = active
+    return jsonify({"success": True, "active": active})
+
+
 @app.route("/api/toggle_stream", methods=["POST"])
 def toggle_stream():
     """
@@ -820,6 +833,28 @@ def toggle_stream():
 ########################################################################
 #  ROUTES – Drone commands
 ########################################################################
+
+@app.route("/api/rc", methods=["POST"])
+def rc_control():
+    """
+    Controllo diretto (bypassa la coda di CommandExecutor).
+    Body JSON: {lr: int, fb: int, ud: int, yaw: int}
+    Valori da -100 a 100.
+    """
+    data = request.get_json(silent=True) or {}
+    lr = int(data.get("lr", 0))
+    fb = int(data.get("fb", 0))
+    ud = int(data.get("ud", 0))
+    yaw = int(data.get("yaw", 0))
+    
+    tello = drone_reader.get_tello()
+    if tello:
+        try:
+            tello.send_rc_control(lr, fb, ud, yaw)
+            return jsonify({"success": True})
+        except Exception as e:
+            return jsonify({"success": False, "message": str(e)})
+    return jsonify({"success": False, "message": "Drone non connesso"})
 
 @app.route("/api/command", methods=["POST"])
 def execute_command():
