@@ -57,7 +57,7 @@ _SPEED_MAX: int = 100
 # Argomenti di default quando il chiamante non ne fornisce uno
 _DEFAULT_MOVE:  int = 30   # cm
 _DEFAULT_ANGLE: int = 90   # gradi
-_DEFAULT_SPEED: int = 30   # cm/s
+_DEFAULT_SPEED: int = int(os.getenv("DRONE_SPEED", 30))   # cm/s
 
 # Priorita' coda comandi (numero minore = precedenza maggiore)
 # Nuovo sistema a 3 livelli: 2=emergency(max), 1=normali, 0=keepalive(min)

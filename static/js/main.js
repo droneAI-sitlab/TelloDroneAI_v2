@@ -42,6 +42,9 @@ const ui = {
     /** Lightweight dedupe guard for accidental double-submit */
     lastSentMessage: "",
     lastSentAt: 0,
+
+    /** RC Speed from backend (default: 70) */
+    rcSpeed: 70,
 };
 
 
@@ -101,6 +104,11 @@ async function _fetchStatus() {
 
         _updateBattery(data.battery);
         _syncTogglesUI(data);
+        
+        // Update RC speed from backend
+        if (typeof data.rc_speed === "number") {
+            ui.rcSpeed = Math.max(0, Math.min(100, data.rc_speed));
+        }
     } catch {
         // Silent fail – server may be temporarily unavailable
     }
@@ -324,17 +332,16 @@ async function sendRCControl(lr, fb, ud, yaw) {
 
 function calcAndSendRC() {
     if (!ui.keyboardMode) return;
-    const speed = 50; // 50% della velocità massima
     let lr = 0, fb = 0, ud = 0, yaw = 0;
     
-    if (activeKeys["w"]) fb += speed;
-    if (activeKeys["s"]) fb -= speed;
-    if (activeKeys["a"]) lr -= speed;
-    if (activeKeys["d"]) lr += speed;
-    if (activeKeys[" "]) ud += speed;
-    if (activeKeys["shift"]) ud -= speed;
-    if (activeKeys["1"]) yaw -= speed; // Antiorario
-    if (activeKeys["2"]) yaw += speed; // Orario
+    if (activeKeys["w"]) fb += ui.rcSpeed;
+    if (activeKeys["s"]) fb -= ui.rcSpeed;
+    if (activeKeys["a"]) lr -= ui.rcSpeed;
+    if (activeKeys["d"]) lr += ui.rcSpeed;
+    if (activeKeys[" "]) ud += ui.rcSpeed;
+    if (activeKeys["shift"]) ud -= ui.rcSpeed;
+    if (activeKeys["1"]) yaw -= ui.rcSpeed; // Antiorario
+    if (activeKeys["2"]) yaw += ui.rcSpeed; // Orario
     
     sendRCControl(lr, fb, ud, yaw);
 }
@@ -487,6 +494,7 @@ async function _startVoiceRecognition() {
             audio: {
                 echoCancellation: true,
                 noiseSuppression: true,
+                autoGainControl: false, // Disabilitato per ridurre rumore di fondo amplificato
                 sampleRate: 16000
             } 
         });
@@ -503,6 +511,18 @@ async function _startVoiceRecognition() {
             
             // Converti Float32 a Int16 PCM (formato richiesto da Vosk)
             const inputData = e.inputBuffer.getChannelData(0);
+            
+            // Noise gate: riduce sensibilità, invia solo quando si parla (~>0.02 amplitude rms)
+            let sum = 0;
+            for (let i = 0; i < inputData.length; i++) {
+                sum += Math.abs(inputData[i]);
+            }
+            const rms = Math.sqrt(sum / inputData.length);
+            if (rms < 0.02) {
+                // Silenzio, non inviamo per non catturare rumore di sottofondo e click del mouse
+                return;
+            }
+
             const pcmData = new Int16Array(inputData.length);
             
             for (let i = 0; i < inputData.length; i++) {
@@ -723,6 +743,55 @@ async function _apiPost(url) {
         return null;
     }
 }
+
+
+// ================================================================
+//  PUSH TO TALK  –  T key & Web Page Click
+// ================================================================
+
+let pushToTalkActive = false;
+
+function _isMutedTarget(element) {
+    if (!element) return false;
+    const tag = element.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "BUTTON") return true;
+    if (element.closest && (element.closest(".settings-modal") || element.closest("button"))) return true;
+    if (element.id === "mic-btn") return true;
+    return false;
+}
+
+document.addEventListener("keydown", (event) => {
+    if (event.key.toLowerCase() === "t") {
+        if (_isMutedTarget(document.activeElement)) return;
+        if (!ui.isRecording && !pushToTalkActive) {
+            pushToTalkActive = true;
+            _startVoiceRecognition();
+        }
+    }
+});
+
+document.addEventListener("keyup", (event) => {
+    if (event.key.toLowerCase() === "t" && pushToTalkActive) {
+        pushToTalkActive = false;
+        _stopVoiceRecognition();
+    }
+});
+
+document.addEventListener("mousedown", (event) => {
+    if (_isMutedTarget(event.target)) return;
+    // Activate on middle or left click
+    if (!ui.isRecording && !pushToTalkActive) {
+        pushToTalkActive = true;
+        _startVoiceRecognition();
+    }
+});
+
+document.addEventListener("mouseup", (event) => {
+    if (pushToTalkActive) {
+        pushToTalkActive = false;
+        _stopVoiceRecognition();
+    }
+});
 
 
 // ================================================================

@@ -101,6 +101,7 @@ FLASK_DEBUG = _env_bool("FLASK_DEBUG", True)
 DRONE_IP    = os.getenv("DRONE_IP",    "192.168.10.1")
 DRONE_PORT  = int(os.getenv("DRONE_PORT",  8889))
 VIDEO_PORT  = int(os.getenv("VIDEO_PORT",  11111))
+DRONE_RC_SPEED = int(os.getenv("DRONE_RC_SPEED", 70))
 
 LOG_MAX_ENTRIES = int(os.getenv("LOG_MAX_ENTRIES", 100))
 
@@ -156,7 +157,7 @@ _state_lock = threading.Lock()
 app_state: dict = {
     "wifi_connected": False,
     "stream_active":  False,
-    "keyboard_mode":  False,   # True se lo switch Tastiera RC è attivo
+    "keyboard_mode":  False,
     "battery":        0,       # 0-100 %
     "logs":           [],
     "fps":            0.0,     # FPS in tempo reale
@@ -313,10 +314,16 @@ def _reload_runtime_config(changed_keys: set[str] | None = None) -> tuple[list[s
     global OCR_ENABLED, FUNCTIONGEMMA_ENABLED
     global COMMAND_BUFFER_DELAY_SECONDS, KEEPALIVE_COOLDOWN_SECONDS, KEEPALIVE_USE_NO_RESPONSE
     global COMMAND_DEDUP_WINDOW_SECONDS, CHAT_MESSAGE_DEDUP_WINDOW_SECONDS
+    global DRONE_RC_SPEED
 
     changed = changed_keys or set()
 
     LOG_MAX_ENTRIES = _env_int("LOG_MAX_ENTRIES", LOG_MAX_ENTRIES)
+    DRONE_RC_SPEED = _env_int("DRONE_RC_SPEED", DRONE_RC_SPEED)
+    # Aggiorna anche velocità di the flight defaults
+    import drone.command_executor
+    drone.command_executor._DEFAULT_SPEED = _env_int("DRONE_SPEED", drone.command_executor._DEFAULT_SPEED)
+
     DRONE_WIFI_SSID = os.getenv("DRONE_WIFI_SSID", DRONE_WIFI_SSID)
     WIFI_TIMEOUT = _env_int("WIFI_CONNECT_TIMEOUT", WIFI_TIMEOUT)
 
@@ -450,6 +457,7 @@ def _hard_disconnect_drone(
 
         with _state_lock:
             app_state["stream_active"] = False
+            app_state["keyboard_mode"] = False
             app_state["battery"] = 0
             app_state["fps"] = 0.0
             if force_wifi_state is not None:
@@ -585,11 +593,9 @@ def _command_buffer_worker() -> None:
             # Buffer vuoto - controlla se serve keepalive
             with _state_lock:
                 stream_on = app_state["stream_active"]
-                keyboard_mode = app_state.get("keyboard_mode", False)
             
-            # Non inviare keepalive automatico in modalità RC (Tastiera), i comandi continui bastano
-            # e potrebbero interferire coi comandi inviati manualmente in burst
-            if not stream_on or not command_executor.is_flying() or keyboard_mode:
+            if not stream_on or not command_executor.is_flying():
+                # Nessun keepalive se stream spento o drone a terra
                 time.sleep(0.1)
                 continue
             
@@ -760,16 +766,6 @@ def toggle_wifi():
     return jsonify({"success": True, "connected": True, "message": f"WiFi connesso a {DRONE_WIFI_SSID}"})
 
 
-@app.route("/api/toggle_keyboard", methods=["POST"])
-def toggle_keyboard():
-    """Aggiorna lo stato della modalità testiera RC in backend, per spegnere il keepalive."""
-    data = request.get_json(silent=True) or {}
-    active = bool(data.get("active", False))
-    with _state_lock:
-        app_state["keyboard_mode"] = active
-    return jsonify({"success": True, "active": active})
-
-
 @app.route("/api/toggle_stream", methods=["POST"])
 def toggle_stream():
     """
@@ -830,31 +826,61 @@ def toggle_stream():
     return jsonify({"success": ok, "active": ok, "message": msg})
 
 
-########################################################################
-#  ROUTES – Drone commands
-########################################################################
+@app.route("/api/toggle_keyboard", methods=["POST"])
+def toggle_keyboard():
+    """
+    Abilita o disabilita la modalità RC da tastiera lato frontend.
+
+    L'endpoint esiste per allineare lo stato server-side al toggle UI.
+    """
+    data = request.get_json(silent=True) or {}
+    active = bool(data.get("active", False))
+
+    with _state_lock:
+        app_state["keyboard_mode"] = active
+
+    add_log(
+        "Modalità tastiera RC attivata" if active else "Modalità tastiera RC disattivata",
+        "system",
+    )
+    return jsonify({"success": True, "active": active, "message": "ok"})
+
 
 @app.route("/api/rc", methods=["POST"])
 def rc_control():
     """
-    Controllo diretto (bypassa la coda di CommandExecutor).
-    Body JSON: {lr: int, fb: int, ud: int, yaw: int}
-    Valori da -100 a 100.
+    Invia un comando RC continuo a Tello.
+
+    Body JSON: {lr, fb, ud, yaw}
+    Valori attesi: interi nell'intervallo [-100, 100].
     """
     data = request.get_json(silent=True) or {}
-    lr = int(data.get("lr", 0))
-    fb = int(data.get("fb", 0))
-    ud = int(data.get("ud", 0))
-    yaw = int(data.get("yaw", 0))
-    
+
+    if not wifi.is_connected_to(DRONE_WIFI_SSID):
+        return jsonify({"success": False, "message": "WiFi del drone non connesso"}), 409
+
     tello = drone_reader.get_tello()
-    if tello:
-        try:
-            tello.send_rc_control(lr, fb, ud, yaw)
-            return jsonify({"success": True})
-        except Exception as e:
-            return jsonify({"success": False, "message": str(e)})
-    return jsonify({"success": False, "message": "Drone non connesso"})
+    if tello is None:
+        return jsonify({"success": False, "message": "Drone non connesso – avvia lo stream prima"}), 409
+
+    try:
+        lr = max(-100, min(100, int(data.get("lr", 0))))
+        fb = max(-100, min(100, int(data.get("fb", 0))))
+        ud = max(-100, min(100, int(data.get("ud", 0))))
+        yaw = max(-100, min(100, int(data.get("yaw", 0))))
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "message": "Parametri RC non validi"}), 400
+
+    try:
+        tello.send_rc_control(lr, fb, ud, yaw)
+        return jsonify({"success": True, "message": "ok", "lr": lr, "fb": fb, "ud": ud, "yaw": yaw})
+    except Exception as exc:
+        return jsonify({"success": False, "message": f"Errore RC: {exc}"}), 500
+
+
+########################################################################
+#  ROUTES – Drone commands
+########################################################################
 
 @app.route("/api/command", methods=["POST"])
 def execute_command():
@@ -1101,13 +1127,14 @@ def get_status():
     """
     Return the current application state.
     Polled by the frontend every few seconds.
-    Returns JSON: {wifi_connected, stream_active, battery}
+    Returns JSON: {wifi_connected, stream_active, battery, rc_speed}
     """
     with _state_lock:
         return jsonify({
             "wifi_connected": app_state["wifi_connected"],
             "stream_active":  app_state["stream_active"],
             "battery":        app_state["battery"],
+            "rc_speed":       DRONE_RC_SPEED,
         })
 
 
@@ -1337,6 +1364,8 @@ def get_config():
         "DRONE_IP": "Indirizzo IP del drone Tello sulla rete locale",
         "DRONE_PORT": "Porta comando del drone (default: 8889)",
         "VIDEO_PORT": "Porta per il flusso video del drone (default: 11111)",
+        "DRONE_SPEED": "Velocità di volo di default in cm/s (10-100, default: 30)",
+        "DRONE_RC_SPEED": "Velocità controllo RC da tastiera (0-100, dove 100 = velocità massima, default: 70)",
         "LOG_MAX_ENTRIES": "Numero massimo di entry nel log (0-100)",
         "DRONE_WIFI_SSID": "Nome della rete WiFi del drone (es. TELLO-XXXXXX)",
         "WIFI_CONNECT_TIMEOUT": "Timeout connessione WiFi in secondi (15 = default)",
