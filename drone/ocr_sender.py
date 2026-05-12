@@ -28,6 +28,7 @@
 import os
 import time
 import threading
+import queue
 from typing import Optional
 
 import cv2
@@ -100,6 +101,16 @@ class OCRSender:
         # ── Ultime parole OCR pulite (senza confidenza) + id risultato ──
         self.last_words: list = []
         self.last_result_id: int = 0
+        
+        # ── Coda per thread worker (1 frame max alla volta) ───────────────
+        self._frame_queue = queue.Queue(maxsize=1)
+        
+        # ── Lancia singolo thread worker daemon ───────────────────────────
+        threading.Thread(
+            target=self._worker_loop,
+            daemon=True,
+            name="ocr-worker",
+        ).start()
 
         print(
             f"[ocr_sender] Inizializzato → server={self._server_url}"
@@ -177,17 +188,30 @@ class OCRSender:
         # mentre il thread è ancora in esecuzione.
         frame_copy = frame.copy()
 
-        # ── 3. Lancia il thread daemon e torna immediatamente ──────────
-        threading.Thread(
-            target=self._send_in_background,
-            args=(frame_copy,),
-            daemon=True,
-            name="ocr-send",
-        ).start()
+        # ── 3. Mette il frame in coda al worker (drop se coda piena) ───
+        try:
+            # Svuota prima la coda per evitare frame stantii
+            while not self._frame_queue.empty():
+                self._frame_queue.get_nowait()
+        except queue.Empty:
+            pass
+        self._frame_queue.put(frame_copy)
 
-    def _send_in_background(self, frame: np.ndarray) -> None:
+    def _worker_loop(self) -> None:
         """
-        Esegue la pipeline OCR completa in un thread separato.
+        Ciclo infinito del worker: attende frame dalla coda, li codifica
+        e invia al server HTTP, slegando il flusso dai lag delle richieste.
+        """
+        while True:
+            try:
+                frame = self._frame_queue.get()
+                self._process_and_send(frame)
+            except Exception as e:
+                print(f"[ocr_sender] Errore worker thread: {e}")
+
+    def _process_and_send(self, frame: np.ndarray) -> None:
+        """
+        Esegue la pipeline OCR completa su un frame.
 
         Non blocca il chiamante; i risultati vengono stampati nel
         terminale al termine della richiesta HTTP.
