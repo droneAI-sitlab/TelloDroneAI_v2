@@ -590,12 +590,9 @@ def _command_buffer_worker() -> None:
                     time.sleep(chunk)
                     waited += chunk
         else:
-            # Buffer vuoto - controlla se serve keepalive
-            with _state_lock:
-                stream_on = app_state["stream_active"]
-            
-            if not stream_on or not command_executor.is_flying():
-                # Nessun keepalive se stream spento o drone a terra
+            # Buffer vuoto - controlla se serve keepalive            
+            if drone_reader.get_tello() is None:
+                # Nessun keepalive se non connesso SDK
                 time.sleep(0.1)
                 continue
             
@@ -652,12 +649,10 @@ threading.Thread(
 ########################################################################
 
 def _battery_poll_loop() -> None:
-    """Interroga la batteria del drone ogni 10 s mentre lo stream è attivo."""
+    """Interroga la batteria del drone ogni 10 s se connesso (anche senza stream)."""
     while True:
         time.sleep(10)
-        with _state_lock:
-            stream_on = app_state["stream_active"]
-        if stream_on:
+        if drone_reader.get_tello() is not None:
             level = drone_reader.get_battery()
             with _state_lock:
                 app_state["battery"] = level
@@ -759,11 +754,18 @@ def toggle_wifi():
         return jsonify({"success": False, "connected": False, "message": msg})
 
     add_log(f"WiFi connesso a {DRONE_WIFI_SSID}", "success")
+    
+    # Inizializza subito la connessione ai comandi del drone (SDK)
+    ok_drone = drone_reader.connect_drone()
+    if not ok_drone:
+        msg = "WiFi connesso, ma fallita comunicazione con l'SDK del drone"
+        add_log(msg, "warning")
+        return jsonify({"success": True, "connected": True, "message": msg})
 
     with _state_lock:
         app_state["wifi_connected"] = True
 
-    return jsonify({"success": True, "connected": True, "message": f"WiFi connesso a {DRONE_WIFI_SSID}"})
+    return jsonify({"success": True, "connected": True, "message": f"WiFi connesso a {DRONE_WIFI_SSID} e drone pronto"})
 
 
 @app.route("/api/toggle_stream", methods=["POST"])
@@ -797,11 +799,10 @@ def toggle_stream():
         )
 
     if currently_on:
-        _hard_disconnect_drone(
-            "Stream fermato su richiesta utente",
-            disconnect_wifi=False,
-            log_level="warning",
-        )
+        drone_reader.stop_stream()
+        with _state_lock:
+            app_state["stream_active"] = False
+        add_log("Stream fermato su richiesta utente (SDK connesso)", "warning")
         return jsonify({"success": True, "active": False, "message": "Stream fermato"})
 
     # ── Connetti al drone e avvia stream in un’unica operazione ──────────
@@ -861,7 +862,7 @@ def rc_control():
 
     tello = drone_reader.get_tello()
     if tello is None:
-        return jsonify({"success": False, "message": "Drone non connesso – avvia lo stream prima"}), 409
+        return jsonify({"success": False, "message": "Drone non pronto (SDK offline)"}), 409
 
     try:
         lr = max(-100, min(100, int(data.get("lr", 0))))
@@ -1658,4 +1659,5 @@ if __name__ == "__main__":
         port=FLASK_PORT,
         debug=FLASK_DEBUG,
         threaded=True,
+        ssl_context='adhoc'
     )

@@ -68,30 +68,44 @@ class DroneReader:
         self._lock = threading.Lock()
 
     # ----------------------------------------------------------------
+    #  CONNESSIONE BASE
+    # ----------------------------------------------------------------
+
+    def connect_drone(self) -> bool:
+        """
+        Inizializza l'oggetto Tello e apre la comunicazione (senza avviare stream).
+        """
+        if self._tello is not None:
+            return True # Già connesso
+
+        self.cleanup_connection()
+        try:
+            self._tello = Tello(host=self._host)
+            self._tello.RESPONSE_TIMEOUT = _DRONE_RESPONSE_TIMEOUT
+            self._tello.connect()
+            print("[frame_reader] Connesso al drone (solo comandi)")
+            return True
+        except Exception as exc:
+            print(f"[frame_reader] Errore in connect_drone(): {exc}")
+            self.cleanup_connection()
+            return False
+
+    # ----------------------------------------------------------------
     #  STREAM VIDEO
     # ----------------------------------------------------------------
 
     def start_stream(self) -> bool:
         """
-        Connette al drone e avvia lo stream MJPEG in un'unica operazione.
-        Replica il pattern di get_tello_client(): connect → streamoff → streamon → get_frame_read.
+        Avvia lo stream video. Connette al drone se non già connesso.
 
         Returns:
             True  – stream avviato
             False – errore
         """
-        # Prima di una nuova sessione libera sempre eventuali socket/stream pendenti.
-        self.cleanup_connection()
+        if not self.connect_drone():
+            return False
 
         try:
-            # Crea un'istanza Tello fresca ad ogni avvio stream
-            self._tello = Tello(host=self._host)
-            self._tello.RESPONSE_TIMEOUT = _DRONE_RESPONSE_TIMEOUT
-
-            # Connessione al drone
-            self._tello.connect()
-            print("[frame_reader] Connesso al drone")
-
             # Stop preventivo in caso di stream già attivo
             try:
                 self._tello.streamoff()
@@ -214,10 +228,7 @@ class DroneReader:
         Returns:
             int 0-100 (percentuale), oppure 0 in caso di errore
         """
-        with self._lock:
-            ready = self._stream_ready
-
-        if not ready or self._tello is None:
+        if self._tello is None:
             return 0
 
         try:

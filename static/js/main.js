@@ -489,6 +489,10 @@ async function _startVoiceRecognition() {
     const btn = document.getElementById("mic-btn");
 
     try {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            throw new Error("API MediaDevices non disponibile. Usa localhost o HTTPS.");
+        }
+
         // Richiedi accesso al microfono
         ui.micStream = await navigator.mediaDevices.getUserMedia({ 
             audio: {

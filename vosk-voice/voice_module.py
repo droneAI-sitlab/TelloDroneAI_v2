@@ -31,8 +31,6 @@ _on_partial_callback = None
 _min_final_chars = 4
 _min_avg_confidence = 0.7
 _dedupe_window_seconds = 2.0
-_require_wake_word = False
-_wake_word = "drone"
 _recent_finals = {}
 _recent_lock = threading.Lock()
 
@@ -86,21 +84,6 @@ def _compute_avg_confidence(result_payload: dict) -> float:
     return sum(conf_values) / len(conf_values)
 
 
-def _extract_command_from_wake_word(text: str) -> str:
-    normalized = _normalize_text(text)
-    wake = _normalize_text(_wake_word)
-
-    if not wake:
-        return normalized
-
-    match = re.search(rf"\b{re.escape(wake)}\b", normalized)
-    if not match:
-        return ""
-
-    command = normalized[match.end():].strip(" ,.!?;:")
-    return command
-
-
 def _is_duplicate_final(text: str, session_id: int) -> bool:
     if _dedupe_window_seconds <= 0:
         return False
@@ -126,11 +109,6 @@ def _is_duplicate_final(text: str, session_id: int) -> bool:
 def _filter_final_text(text: str, result_payload: dict, session_id: int) -> tuple[bool, str, float]:
     candidate = _normalize_text(text)
 
-    if _require_wake_word:
-        candidate = _extract_command_from_wake_word(candidate)
-        if not candidate:
-            return False, "wake-word assente", 0.0
-
     if len(candidate) < _min_final_chars:
         return False, "testo troppo corto", 0.0
 
@@ -152,8 +130,6 @@ def init_voice_module(
     min_final_chars=None,
     min_avg_confidence=None,
     dedupe_window_seconds=None,
-    require_wake_word=None,
-    wake_word=None,
 ):
     """
     Inizializza il modulo vocale.
@@ -173,7 +149,6 @@ def init_voice_module(
     """
     global _vosk_model, _sock, _on_transcription_callback, _on_partial_callback
     global _min_final_chars, _min_avg_confidence, _dedupe_window_seconds
-    global _require_wake_word, _wake_word
 
     # Carica .env se presente (utile anche in uso standalone del modulo)
     load_dotenv(override=False)
@@ -181,8 +156,6 @@ def init_voice_module(
     env_min_final_chars = _env_int("VOICE_MIN_FINAL_CHARS", 4)
     env_min_avg_confidence = _env_float("VOICE_MIN_AVG_CONFIDENCE", 0.7)
     env_dedupe_window = _env_float("VOICE_DEDUPE_WINDOW_SECONDS", 2.0)
-    env_require_wake_word = _env_bool("VOICE_REQUIRE_WAKE_WORD", True)
-    env_wake_word = str(os.getenv("VOICE_WAKE_WORD", "drone")).strip().lower() or "drone"
     
     # Salva i callback
     _on_transcription_callback = on_transcription
@@ -196,8 +169,6 @@ def init_voice_module(
         0.0,
         float(env_dedupe_window if dedupe_window_seconds is None else dedupe_window_seconds),
     )
-    _require_wake_word = bool(env_require_wake_word if require_wake_word is None else require_wake_word)
-    _wake_word = str(env_wake_word if wake_word is None else wake_word).strip().lower() or "drone"
     
     # Carica il modello Vosk
     print(f"[VoiceModule] Caricamento modello da: {model_path}")
@@ -221,8 +192,7 @@ def init_voice_module(
         "[VoiceModule] Filtri attivi: "
         f"min_chars={_min_final_chars}, "
         f"min_conf={_min_avg_confidence:.2f}, "
-        f"dedupe={_dedupe_window_seconds:.2f}s, "
-        f"wake_word={'on' if _require_wake_word else 'off'}"
+        f"dedupe={_dedupe_window_seconds:.2f}s"
     )
 
 

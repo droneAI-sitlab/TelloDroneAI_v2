@@ -350,7 +350,7 @@ class CommandExecutor:
         # ── 2. Verifica connessione ────────────────────────────────────
         tello = self._reader.get_tello()
         if tello is None:
-            return False, "Drone non connesso – avvia lo stream prima"
+            return False, "Drone non connesso (SDK) – controlla il WiFi"
 
         # ── 3. Calcolo argomento effettivo ─────────────────────────────
         effective_arg = self._resolve_argument(canonical, argument, entry)
