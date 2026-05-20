@@ -299,6 +299,35 @@ body {
     outline-offset: 2px;
 }
 
+/* ----------------------------------------------------------------
+   MEDIA CONTROLS BUTTONS
+---------------------------------------------------------------- */
+.btn-media {
+    background: var(--clr-bg);
+    border: 1px solid var(--clr-border);
+    border-radius: 50%;
+    width: 44px;
+    height: 44px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    color: var(--clr-text);
+    font-size: 1.1rem;
+    transition: all 0.2s ease;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+}
+
+.btn-media:hover {
+    background: var(--clr-panel);
+    color: var(--clr-green-600);
+    transform: translateY(-1px);
+}
+
+.btn-media:active {
+    transform: translateY(0);
+}
+
 
 /* ================================================================
    RIGHT PANEL  –  1/4 of horizontal space

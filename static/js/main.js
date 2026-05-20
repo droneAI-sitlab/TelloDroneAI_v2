@@ -86,15 +86,38 @@ async function _performCleanup() {
 // ================================================================
 
 /**
- * Start two polling loops:
+ * Start three polling loops:
  *   - status every 2 s  (battery, toggle states)
  *   - logs   every 1 s  (new log entries)
  *   - fps    every 0.5s (stream FPS)
+ *   - media  every 2 s  (recording status)
  */
 function _startPolling() {
     setInterval(_fetchStatus, 2000);
     setInterval(_fetchLogs,   1000);
     setInterval(_fetchFps,    500);
+    setInterval(_fetchMediaStatus, 2000);
+}
+
+async function _fetchMediaStatus() {
+    try {
+        const res = await fetch("/api/media/status");
+        if (!res.ok) return;
+        const data = await res.json();
+        
+        const btnStart = document.getElementById("btn-record-start");
+        const btnStop = document.getElementById("btn-record-stop");
+        
+        if (data.recording) {
+            btnStart.style.display = "none";
+            btnStop.style.display = "flex";
+        } else {
+            btnStart.style.display = "flex";
+            btnStop.style.display = "none";
+        }
+    } catch {
+        // Silent fail
+    }
 }
 
 async function _fetchStatus() {
@@ -292,6 +315,44 @@ async function toggleKeyboardMode(checkbox) {
     
     addLocalLog("system", ui.keyboardMode ? "Modalità di controllo RC da tastiera ATTIVATA" : "Modalità di controllo RC da tastiera DISATTIVATA");
     _blurToggle(checkbox);
+}
+
+/**
+ * Scatta Screenshot
+ */
+async function takePhoto() {
+    const res = await _apiPost("/api/media/photo");
+    if (res && res.success) {
+        // Success is logged by backend and fetched in polling
+    } else if (res && !res.success) {
+        addLocalLog("error", res.message || "Errore screenshot");
+    }
+}
+
+/**
+ * Avvia registrazione video
+ */
+async function startRecording() {
+    const res = await _apiPost("/api/media/video/start");
+    if (res && res.success) {
+        document.getElementById("btn-record-start").style.display = "none";
+        document.getElementById("btn-record-stop").style.display = "flex";
+    } else if (res && !res.success) {
+        addLocalLog("error", res.message || "Errore avvio registrazione");
+    }
+}
+
+/**
+ * Ferma registrazione video
+ */
+async function stopRecording() {
+    const res = await _apiPost("/api/media/video/stop");
+    if (res && res.success) {
+        document.getElementById("btn-record-stop").style.display = "none";
+        document.getElementById("btn-record-start").style.display = "flex";
+    } else if (res && !res.success) {
+        addLocalLog("error", res.message || "Errore stop registrazione");
+    }
 }
 
 let activeKeys = {};

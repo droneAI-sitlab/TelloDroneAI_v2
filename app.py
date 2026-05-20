@@ -216,7 +216,7 @@ frame_processor = FrameProcessor(
 ocr_sender = OCRSender()
 
 # DroneMediaCapture gestisce foto e registrazione video da stream drone
-media_capture = DroneMediaCapture(drone_reader)
+media_capture = DroneMediaCapture(drone_reader, frame_processor)
 
 # CommandExecutor traduce nomi-comando → chiamate SDK djitellopy
 command_executor = CommandExecutor(
@@ -373,6 +373,8 @@ def _reload_runtime_config(changed_keys: set[str] | None = None) -> tuple[list[s
 
     runtime_keys = {
         "LOG_MAX_ENTRIES",
+        "DRONE_SPEED",
+        "DRONE_RC_SPEED",
         "DRONE_WIFI_SSID",
         "WIFI_CONNECT_TIMEOUT",
         "FRAME_WIDTH",

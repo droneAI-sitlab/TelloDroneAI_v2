@@ -130,6 +130,22 @@
                 <span class="toggle-item__status" id="keyboard-status">OFF</span>
             </div>
 
+            <!-- Separator -->
+            <div class="controls-separator" style="width: 1px; background: var(--clr-border); height: 40px; margin: 0 10px;"></div>
+
+            <!-- Media toggles -->
+            <div class="media-controls" style="display: flex; gap: 12px; align-items: center;">
+                <button class="btn-media" id="btn-photo" onclick="takePhoto()" title="Scatta Screenshot">
+                    <i class="fas fa-camera"></i>
+                </button>
+                <button class="btn-media" id="btn-record-start" onclick="startRecording()" title="Avvia Registrazione">
+                    <i class="fas fa-video"></i>
+                </button>
+                <button class="btn-media" id="btn-record-stop" onclick="stopRecording()" title="Ferma Registrazione" style="display: none; background: #ffebee; color: #dc3545; border-color: #f5c6cb;">
+                    <i class="fas fa-stop"></i>
+                </button>
+            </div>
+
         </div>
         <!-- /controls-bar -->
 

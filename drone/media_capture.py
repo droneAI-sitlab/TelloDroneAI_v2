@@ -13,13 +13,15 @@ from typing import Optional
 import cv2
 
 from drone.frame_reader import DroneReader
+from drone.frame_processor import FrameProcessor
 
 
 class DroneMediaCapture:
-    """Gestisce scatto foto e registrazione video dal feed di DroneReader."""
+    """Gestisce scatto foto e registrazione video dal feed di DroneReader e FrameProcessor."""
 
-    def __init__(self, drone_reader: DroneReader) -> None:
+    def __init__(self, drone_reader: DroneReader, frame_processor: FrameProcessor) -> None:
         self._reader = drone_reader
+        self._processor = frame_processor
         self._lock = threading.Lock()
 
         self._output_dir = os.getenv("MEDIA_OUTPUT_DIR", "captures")
@@ -51,11 +53,14 @@ class DroneMediaCapture:
         if frame is None:
             raise RuntimeError("Nessun frame disponibile: avvia lo stream prima")
 
+        processed_frame = self._processor.process_to_frame(frame)
+        if processed_frame is None:
+            raise RuntimeError("Errore durante l'elaborazione del frame per la foto")
+
         self._ensure_output_dir()
         file_path = self._build_output_path("photo", "jpg")
 
-        bgr_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        ok = cv2.imwrite(file_path, bgr_frame)
+        ok = cv2.imwrite(file_path, processed_frame)
         if not ok:
             raise RuntimeError("Salvataggio foto fallito")
 
@@ -70,11 +75,15 @@ class DroneMediaCapture:
             frame = self._reader.get_frame()
             if frame is None:
                 raise RuntimeError("Nessun frame disponibile: avvia lo stream prima")
+                
+            processed_frame = self._processor.process_to_frame(frame)
+            if processed_frame is None:
+                raise RuntimeError("Errore elaborazione frame per avvio stream")
 
             self._ensure_output_dir()
             file_path = self._build_output_path("video", "mp4")
 
-            height, width, _ = frame.shape
+            height, width, _ = processed_frame.shape
             fourcc = cv2.VideoWriter_fourcc(*self._video_codec)
             writer = cv2.VideoWriter(file_path, fourcc, self._video_fps, (width, height))
             if not writer.isOpened():
@@ -141,7 +150,10 @@ class DroneMediaCapture:
                 time.sleep(0.01)
                 continue
 
-            bgr_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            processed_frame = self._processor.process_to_frame(frame)
+            if processed_frame is None:
+                time.sleep(0.01)
+                continue
 
             with self._lock:
                 writer = self._video_writer
@@ -149,7 +161,7 @@ class DroneMediaCapture:
             if writer is None:
                 break
 
-            writer.write(bgr_frame)
+            writer.write(processed_frame)
             time.sleep(frame_interval)
 
         with self._lock:
