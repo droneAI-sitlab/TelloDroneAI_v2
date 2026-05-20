@@ -6,15 +6,7 @@ Applicazione Flask per il controllo e il monitoraggio del drone DJI Tello tramit
 
 ## Panoramica
 
-**TelloAI** è un'applicazione completa per controllare il drone DJI Tello da una dashboard web moderna. Il progetto combina:
-
-- **Dashboard web** interattiva in Flask con video streaming in tempo reale
-- **Controllo WiFi** nativo Windows (netsh) per connessione al drone
-- **Stream video** elaborato con OpenCV (resize, contrasto, hook AI)
-- **Integrazione OCR** con server remoto per riconoscimento testo dai frame
-- **Modelli AI** (Ollama + FunctionGemma) per parsing OCR e generazione comandi automatici
-- **Esecuzione comandi** thread-safe con queue buffer e delay configurabili
-- **Logging in tempo reale** visibile nella UI
+**TelloDroneAI_v2** è un sistema intelligente che permette di gestire un drone DJI Tello tramite una comoda dashboard web, combinando il volo manuale con comandi vocali in italiano offline. Grazie all'integrazione di Intelligenza Artificiale e computer vision, il drone non solo trasmette video in tempo reale e permette di scattare foto o registrare video, ma è anche in grado di analizzare l'ambiente circostante, leggere testi (OCR) e sfruttare modelli linguistici (Ollama) per "comprendere" e descrivere ciò che vede.
 
 ---
 
@@ -198,8 +190,9 @@ La dashboard è divisa in due sezioni:
 - **WiFi toggle** – Connette/disconnette il drone (netsh)
 - **Stream toggle** – Avvia/ferma lo stream video (dipende da WiFi)
 - **OCR toggle** – Attiva/disattiva invio frame al server OCR
+- **Vosk Vocale** – Controllo vocale offline in italiano con libreria Vosk
+- **Foto/Video** – Controlli per acquisire media in locale
 - **Casella messaggi** – Invia comandi testuali al drone
-- **Microfono** – Web Speech API per comandi vocali (italiano)
 - **Log in tempo reale** – Mostra debug e feedback delle azioni
 
 ### Flusso di utilizzo
@@ -215,8 +208,8 @@ La dashboard è divisa in due sezioni:
 
 3. **Invia comandi**
    - **Manualmente:** Scrivi nell'input testuale (es. "takeoff", "move_forward 50") e premi invio o clicca il bottone
-   - **Vocale:** Clicca il microfono e parla in italiano (es. "decolla" → `takeoff`)
-   - **Automatico:** Attiva "OCR" per inviare frame al server remoto
+   - **Vocale (Vosk):** Usa l'apposito modulo integrato offline per impartire comandi naturali in italiano
+   - **Automatico:** Attiva "OCR" per inviare frame al server remoto e generare azioni tramite Ollama
 
 4. **Monitora l'esecuzione**
    - La sezione "Log" mostra tutti gli eventi (connessioni, comandi, errori)
@@ -320,19 +313,19 @@ FrameProcessor
 ### Flusso comandi
 
 ```
-Utente (UI / Vocale / Automatico OCR)
+Utente (UI / Vocale Vosk / Automatico OCR)
     │
     ├─► OCRSender.send_frame() + ollama_client.call_ollama()
     │   ou
     ├─► app.py::send_message (input testuale)
     │   ou
-    └─► Web Speech API (vocale)
+    └─► Vosk Voice Module (vocale offline)
               │
               ▼
         enqueue_executor_commands(list[(name, arg)])
               │
               ▼
-        command_buffer.Queue (FIFO)
+        command_buffer.Queue (Priority Queue)
               │
               ▼
         _command_buffer_worker() daemon
@@ -359,12 +352,14 @@ Utente (UI / Vocale / Automatico OCR)
 | **drone/wifi.py** | Connessione WiFi Windows via `netsh wlan` | Specifico del SO |
 | **drone/frame_reader.py** | Wrapper djitellopy con acquisizione frame e stream control | Gestisce lifecycle drone |
 | **drone/frame_processor.py** | Pipeline OpenCV: resize, contrasto, hook AI, encoding JPEG | Elaborazione frame |
+| **drone/media_capture.py** | Gestione salvataggio foto e registrazione video su disco | Multimedia |
 | **drone/ocr_sender.py** | Invio frame remoto con timer, parsing JSON, enqueue comandi | Integration point OCR |
 | **drone/ollama_client.py** | Client HTTP verso Ollama, chat API, parse FunctionGemma output | Integration point AI |
-| **drone/command_executor.py** | Tabella comandi + mapping → SDK djitellopy, validazione argomenti | Command dispatcher |
+| **drone/command_executor.py** | Tabella, mapper e coda con **priorità** (es. emergenza) per comandi al drone | Command dispatcher |
+| **vosk-voice/** | Riconoscimento vocale offline in italiano con modello Vosk | Voice commands |
 | **templates/index.html** | Dashboard HTML, layout, form input, video tag | UI |
 | **static/css/style.css** | Tema verde, componenti, animazioni | Styling |
-| **static/js/main.js** | Polling state, toggle handler, Web Speech API, log rendering | Logica frontend |
+| **static/js/main.js** | Polling state, toggle handler, log rendering | Logica frontend |
 
 ---
 
@@ -468,30 +463,37 @@ Ritorna solo il livello batteria (0-100%).
 
 ## Struttura del progetto
 
-```
+```text
 TelloDroneAI_v2/
 ├── app.py                          ← Entry point Flask
 ├── requirements.txt                ← Dipendenze Python
-├── .env                            ← Configurazione (da creare)
+├── .env                            ← Configurazione
 ├── README.md                       ← Questa documentazione
 │
 ├── drone/                          ← Package moduli drone
 │   ├── __init__.py
-│   ├── wifi.py                   ← Connessione WiFi Windows
-│   ├── frame_reader.py           ← Acquisizione frame (djitellopy)
-│   ├── frame_processor.py        ← Pipeline OpenCV (resize, contrasto)
-│   ├── ocr_sender.py             ← Invio frame a server OCR remoto
-│   ├── ollama_client.py          ← Client HTTP Ollama + parser
-│   └── command_executor.py       ← Esecuzione comandi sulla tabella
+│   ├── wifi.py                   ← Connessione WiFi
+│   ├── frame_reader.py           ← Acquisizione frame
+│   ├── frame_processor.py        ← Pipeline OpenCV
+│   ├── media_capture.py          ← Foto e registrazione Video
+│   ├── ocr_sender.py             ← Endpoint OCR
+│   ├── ollama_client.py          ← Integrazione LLM
+│   └── command_executor.py       ← Motore comandi e Priority Queue
+│
+├── vosk-voice/                     ← Riconoscimento vocale
+│   ├── voice_module.py           ← Core Vosk
+│   └── model-it/                 ← Modello acustico italiano
+│
+├── tests/                          ← Test unitari e integrazione
 │
 ├── templates/                      ← Template HTML
-│   └── index.html                ← Dashboard unica pagina
+│   └── index.html                
 │
 └── static/                         ← Asset frontend
     ├── css/
-    │   └── style.css             ← Foglio di stile (tema verde)
+    │   └── style.css             
     └── js/
-        └── main.js               ← Logica frontend (polling, Speech API)
+        └── main.js               
 ```
 
 ---
@@ -511,17 +513,7 @@ TelloDroneAI_v2/
 - **Flask:** [https://flask.palletsprojects.com/](https://flask.palletsprojects.com/)
 - **OpenCV:** [https://opencv.org/](https://opencv.org/)
 - **Ollama:** [https://ollama.ai/](https://ollama.ai/)
-- **Web Speech API:** [MDN Docs](https://developer.mozilla.org/en-US/docs/Web/API/Web_Speech_API)
-├── requirements.txt        ← dipendenze Python
-├── README.md               ← questo file
-├── templates/
-│   └── index.html          ← unico template HTML
-└── static/
-    ├── css/
-    │   └── style.css       ← tema verde chiaro
-    └── js/
-        └── main.js         ← logica frontend
-```
+- **Vosk:** [https://alphacephei.com/vosk/](https://alphacephei.com/vosk/)
 
 ---
 
