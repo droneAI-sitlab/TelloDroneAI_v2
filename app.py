@@ -1259,25 +1259,28 @@ def _frame_generator():
                 current_result_id = ocr_sender.get_last_result_id()
                 if current_result_id > last_ocr_result_id:
                     ocr_words = ocr_sender.get_last_words()
-                    ok_llm, llm_output, ocr_input = call_ollama_from_ocr_words(ocr_words)
-                    if ocr_input:
-                        print(f"[app] OCR -> Ollama input: {ocr_input}")
-                        if ok_llm:
-                            print(f"[app] Ollama output: {llm_output}")
+                    
+                    def process_ollama(words):
+                        ok_llm, llm_output, ocr_input = call_ollama_from_ocr_words(words)
+                        if ocr_input:
+                            print(f"[app] OCR -> Ollama input: {ocr_input}")
+                            if ok_llm:
+                                print(f"[app] Ollama output: {llm_output}")
 
-                            # Estrae TUTTI i comandi e li mette in buffer per esecuzione sequenziale.
-                            parsed_commands = parse_model_output_to_executor_commands(llm_output)
-                            if parsed_commands:
-                                print(f"[app] Comandi estratti: {parsed_commands}")
-                                enqueued = enqueue_executor_commands(parsed_commands, source="ocr")
-                                add_log(f"Comandi in buffer da OCR: {enqueued}/{len(parsed_commands)}", "system")
+                                # Estrae TUTTI i comandi e li mette in buffer per esecuzione sequenziale.
+                                parsed_commands = parse_model_output_to_executor_commands(llm_output)
+                                if parsed_commands:
+                                    print(f"[app] Comandi estratti: {parsed_commands}")
+                                    enqueued = enqueue_executor_commands(parsed_commands, source="ocr")
+                                    add_log(f"Comandi in buffer da OCR: {enqueued}/{len(parsed_commands)}", "system")
+                                else:
+                                    print("[app] Nessun comando estratto dall'output del modello")
+                                    add_log("Nessun comando estratto da OCR/FunctionGemma", "warning")
                             else:
-                                print("[app] Nessun comando estratto dall'output del modello")
-                                add_log("Nessun comando estratto da OCR/FunctionGemma", "warning")
-                        else:
-                            print(f"[app] Errore chiamata Ollama: {llm_output}")
-                            add_log(f"Errore chiamata Ollama da OCR: {llm_output}", "error")
+                                print(f"[app] Errore chiamata Ollama: {llm_output}")
+                                add_log(f"Errore chiamata Ollama da OCR: {llm_output}", "error")
 
+                    threading.Thread(target=process_ollama, args=(ocr_words,), daemon=True).start()
                     last_ocr_result_id = current_result_id
 
             # ── Regolazione timing prima di encode/yield ─────────────────────

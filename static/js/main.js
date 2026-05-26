@@ -904,22 +904,82 @@ async function openSettingsModal() {
                 label.appendChild(helpIcon);
             }
             
-            const input = document.createElement("input");
-            input.type = "text";
-            input.className = "settings-form-input";
-            input.id = `config-${key}`;
-            input.value = config[key];
-            input.placeholder = `Valore per ${key}`;
-            input.title = descriptions[key] || ""; // Tooltip sull'input
+            const valueStr = String(config[key]);
+            const valueLower = valueStr.toLowerCase();
+            const isBoolean = (valueLower === 'true' || valueLower === 'false');
+            const isNullableBoolean = (valueLower === 'none' && (key.includes('_ENABLED') || key.includes('_USE_')));
+            const isActuallyBoolean = isBoolean || isNullableBoolean;
+            const isNumber = !isNaN(Number(valueStr)) && valueStr !== "" && !isBoolean;
+
+            if (isActuallyBoolean) {
+                // Switch / Checkbox
+                const toggleLabel = document.createElement("label");
+                toggleLabel.className = "toggle-switch";
+                toggleLabel.title = descriptions[key] || "";
+                
+                const input = document.createElement("input");
+                input.type = "checkbox";
+                input.id = `config-${key}`;
+                input.dataset.configKey = key;
+                input.dataset.description = descriptions[key] || "";
+                input.checked = (valueLower === 'true');
+                
+                // Add class for potential future use, without CSS conflicts
+                input.className = "toggle-input";
+                
+                const slider = document.createElement("span");
+                slider.className = "toggle-switch__slider";
+                
+                toggleLabel.appendChild(input);
+                toggleLabel.appendChild(slider);
+                group.appendChild(label);
+                group.appendChild(toggleLabel);
+            } else if (isNumber) {
+                // Number input
+                const input = document.createElement("input");
+                input.type = "number";
+                input.step = "any";
+                input.className = "settings-form-input";
+                input.id = `config-${key}`;
+                input.value = config[key];
+                input.placeholder = `Valore numerico per ${key}`;
+                input.title = descriptions[key] || "";
+                input.dataset.configKey = key;
+                input.dataset.description = descriptions[key] || "";
+                
+                input.addEventListener("input", (e) => _validateConfigField(e.target));
+                
+                // Add specific constraints based on key
+                if (key.includes("SPEED") || key.includes("QUALITY")) {
+                    input.min = "0";
+                    input.max = "100";
+                } else if (key === "LOG_MAX_ENTRIES") {
+                    input.min = "0";
+                    input.max = "100";
+                } else if (key.includes("INTERVAL") || key.includes("TIMEOUT") || key.includes("DELAY")) {
+                    input.min = "0";
+                }
+                
+                group.appendChild(label);
+                group.appendChild(input);
+            } else {
+                // Text input
+                const input = document.createElement("input");
+                input.type = "text";
+                input.className = "settings-form-input";
+                input.id = `config-${key}`;
+                input.value = config[key];
+                input.placeholder = `Valore testuale per ${key}`;
+                input.title = descriptions[key] || "";
+                input.dataset.configKey = key;
+                input.dataset.description = descriptions[key] || "";
+                
+                input.addEventListener("input", (e) => _validateConfigField(e.target));
+                
+                group.appendChild(label);
+                group.appendChild(input);
+            }
             
-            // Add data attributes for validation
-            input.dataset.configKey = key;
-            
-            // Add validation event listeners
-            input.addEventListener("change", (e) => _validateConfigField(e.target, descriptions[key]));
-            
-            group.appendChild(label);
-            group.appendChild(input);
             container.appendChild(group);
         });
         
@@ -935,12 +995,45 @@ async function openSettingsModal() {
  * @param {HTMLInputElement} input
  * @param {string} description
  */
-function _validateConfigField(input, description) {
+function _validateConfigField(input) {
     const key = input.dataset.configKey;
-    const value = input.value.trim();
+    const description = input.dataset.description || "";
+    let value = input.value;
+    if (typeof value === "string") value = value.trim();
     
     // Remove previous error state
     input.classList.remove("settings-form-input--error");
+    
+    if (input.type === "checkbox") {
+        return true;
+    }
+
+    if (input.type === "number") {
+        if (value === "") {
+            input.classList.add("settings-form-input--error");
+            input.title = "❌ Il valore non può essere vuoto";
+            return false;
+        }
+
+        const num = parseFloat(value);
+        if (isNaN(num)) {
+            input.classList.add("settings-form-input--error");
+            input.title = "❌ Inserire un numero valido";
+            return false;
+        }
+
+        if (input.hasAttribute("min") && num < parseFloat(input.min)) {
+            input.classList.add("settings-form-input--error");
+            input.title = `❌ Il valore minimo consentito è ${input.min}`;
+            return false;
+        }
+
+        if (input.hasAttribute("max") && num > parseFloat(input.max)) {
+            input.classList.add("settings-form-input--error");
+            input.title = `❌ Il valore massimo consentito è ${input.max}`;
+            return false;
+        }
+    }
     
     // LOG_MAX_ENTRIES: between 0 and 100
     if (key === "LOG_MAX_ENTRIES") {
@@ -963,7 +1056,8 @@ function _validateConfigField(input, description) {
         }
         input.title = description || "";
     }
-    
+
+    input.title = description || "";
     return true;
 }
 
@@ -983,11 +1077,11 @@ async function saveSettings() {
     const container = document.getElementById("settings-form-container");
     
     // Validate all fields before saving
-    const inputs = container.querySelectorAll(".settings-form-input");
+    const inputs = container.querySelectorAll("input[data-config-key]");
     let hasErrors = false;
     
     inputs.forEach(input => {
-        if (!_validateConfigField(input, input.title)) {
+        if (!_validateConfigField(input)) {
             hasErrors = true;
         }
     });
@@ -1001,7 +1095,11 @@ async function saveSettings() {
     const config = {};
     inputs.forEach(input => {
         const key = input.id.replace("config-", "");
-        config[key] = input.value;
+        if (input.type === "checkbox") {
+            config[key] = input.checked ? "True" : "False";
+        } else {
+            config[key] = input.value;
+        }
     });
     
     try {
