@@ -47,6 +47,7 @@ from drone.ollama_client import (
     get_ollama_config,
 )
 from drone.command_executor import CommandExecutor
+from drone.chat_parser import parse_direct_command
 
 # ── Load environment variables from .env ──────────────────────────────
 # override=True evita che vecchie variabili di ambiente del processo
@@ -1019,12 +1020,9 @@ def send_message():
     )
 
     # Parsing comando e argomento opzionale
-    match = re.match(r"^(.*?)(?:\s+(-?\d+))?$", message_trimmed)
-    if match:
-        direct_command = match.group(1).strip()
-        direct_arg_raw = match.group(2)
-        direct_argument = int(direct_arg_raw) if direct_arg_raw is not None else None
-
+    direct_command, direct_argument = parse_direct_command(message_trimmed)
+    
+    if direct_command:
         ok_direct, msg_direct, canonical_direct, effective_direct_arg = command_executor.validate(
             direct_command,
             direct_argument,
