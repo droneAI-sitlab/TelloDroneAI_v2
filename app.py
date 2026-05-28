@@ -321,9 +321,10 @@ def _reload_runtime_config(changed_keys: set[str] | None = None) -> tuple[list[s
 
     LOG_MAX_ENTRIES = _env_int("LOG_MAX_ENTRIES", LOG_MAX_ENTRIES)
     DRONE_RC_SPEED = _env_int("DRONE_RC_SPEED", DRONE_RC_SPEED)
-    # Aggiorna anche velocità di the flight defaults
+    # Aggiorna anche velocità nei defaults della tabella dei comandi
     import drone.command_executor
-    drone.command_executor._DEFAULT_SPEED = _env_int("DRONE_SPEED", drone.command_executor._DEFAULT_SPEED)
+    if "set_speed" in drone.command_executor.COMMAND_TABLE:
+        drone.command_executor.COMMAND_TABLE["set_speed"]["default"] = _env_int("DRONE_SPEED", 30)
 
     DRONE_WIFI_SSID = os.getenv("DRONE_WIFI_SSID", DRONE_WIFI_SSID)
     WIFI_TIMEOUT = _env_int("WIFI_CONNECT_TIMEOUT", WIFI_TIMEOUT)

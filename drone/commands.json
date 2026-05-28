@@ -89,6 +89,12 @@
     "default": null,
     "aliases": []
   },
+  "set_speed": {
+    "desc": "Imposta velocità di volo",
+    "unit": "cm/s",
+    "default": 30,
+    "aliases": ["velocita", "speed"]
+  },
   "send_keepalive": {
     "desc": "Invia heartbeat per mantenere la sessione attiva",
     "unit": "",

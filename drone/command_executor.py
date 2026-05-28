@@ -78,6 +78,7 @@ _FUNCTIONS_MAP = {
     "flip_back": lambda t, _: t.flip_back(),
     "flip_left": lambda t, _: t.flip_left(),
     "flip_right": lambda t, _: t.flip_right(),
+    "set_speed": lambda t, arg: t.set_speed(arg),
     "send_keepalive": lambda t, _: t.send_keepalive(),
     "send_keepalive_no_response": _send_keepalive_without_return,
 }
