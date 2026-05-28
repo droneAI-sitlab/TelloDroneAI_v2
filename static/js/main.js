@@ -198,11 +198,34 @@ function _updateBattery(percent) {
 
 /**
  * Synchronise the two toggle switches with the server's current state.
- * @param {{ wifi_connected: boolean, stream_active: boolean }} data
+ * @param {{ wifi_connected: boolean, stream_active: boolean, allow_parser_takeoff: boolean }} data
  */
 function _syncTogglesUI(data) {
     _setToggle("wifi",   data.wifi_connected);
     _setToggle("stream", data.stream_active);
+    _setToggle("parser-takeoff", data.allow_parser_takeoff);
+
+    const streamToggle = document.getElementById("stream-toggle");
+    if (streamToggle && streamToggle.dataset.busy !== "true") {
+        streamToggle.disabled = !data.wifi_connected;
+        const streamParent = streamToggle.closest('.toggle-item');
+        if (streamParent) {
+            streamParent.style.opacity = data.wifi_connected ? "1" : "0.5";
+            streamParent.style.pointerEvents = data.wifi_connected ? "auto" : "none";
+        }
+    }
+    
+    // Assicura che la visualizzazione video segua lo stato del backend
+    // quando questo cambia implicitamente (es. disconnessione WiFi)
+    const feed = document.getElementById("video-feed");
+    const placeholder = document.getElementById("video-placeholder");
+    if (feed && placeholder && streamToggle && streamToggle.dataset.busy !== "true") {
+        if (!data.stream_active && feed.style.display !== "none") {
+            feed.src = "";
+            feed.style.display = "none";
+            placeholder.style.display = "flex";
+        }
+    }
 }
 
 /**
@@ -214,10 +237,13 @@ function _setToggle(name, active) {
     const checkbox = document.getElementById(`${name}-toggle`);
     const status   = document.getElementById(`${name}-status`);
 
-    if (checkbox) checkbox.checked = active;
-    if (status) {
-        status.textContent = active ? "ON" : "OFF";
-        status.classList.toggle("on", active);
+    // Only update if not actively being toggled by the user
+    if (checkbox && checkbox.dataset.busy !== "true") {
+        checkbox.checked = active;
+        if (status) {
+            status.textContent = active ? "ON" : "OFF";
+            status.classList.toggle("on", active);
+        }
     }
 }
 
@@ -242,14 +268,59 @@ function _blurToggle(checkbox) {
  * @param {HTMLInputElement} checkbox
  */
 async function toggleWifi(checkbox) {
+    const isTurningOn = checkbox.checked;
+    const status = document.getElementById(`wifi-status`);
+    const slider = checkbox.nextElementSibling;
+    
+    checkbox.disabled = true;
+    checkbox.dataset.busy = "true";
+
+    if (isTurningOn) {
+        if (status) {
+            status.textContent = "CONN...";
+        }
+        if (slider) {
+            slider.style.backgroundColor = "orange";
+        }
+    } else {
+        if (status) status.textContent = "OFF...";
+    }
+
     const ok = await _apiPost("/api/toggle_wifi");
-    if (!ok) {
-        checkbox.checked = !checkbox.checked; // revert on failure
+
+    // Reset inline styles applied during CONN... state
+    if (slider) slider.style.backgroundColor = "";
+
+    // Se ci troviamo in uno switch di rete e la fetch salta o è pendente
+    if (ok && ok.pending_wifi_switch) {
+        addLocalLog("info", "Cambio rete in corso... Attendere riconnessione");
+        // Lasciamo che sia il _startPolling a settare ON/OFF nei prossimi secondi.
+        // Dobbiamo rimuovere il dataset.busy altrimenti lo _startPolling non aggiornerà la UI
+        checkbox.disabled = false;
+        delete checkbox.dataset.busy;
         _blurToggle(checkbox);
         return;
     }
+    
+    if (!ok) {
+        checkbox.checked = !isTurningOn; // revert on failure
+        checkbox.disabled = false;
+        delete checkbox.dataset.busy;
+        if (status) {
+            status.textContent = checkbox.checked ? "ON" : "OFF";
+            status.classList.toggle("on", checkbox.checked);
+        }
+        _blurToggle(checkbox);
+        return;
+    }
+    
+    // Override local element disabled to allow _setToggle to update
+    checkbox.disabled = false;
+    delete checkbox.dataset.busy;
+
     _setToggle("wifi", ok.connected);
     addLocalLog(ok.connected ? "success" : "warning", ok.message);
+    
     _blurToggle(checkbox);
 }
 
@@ -258,12 +329,44 @@ async function toggleWifi(checkbox) {
  * @param {HTMLInputElement} checkbox
  */
 async function toggleStream(checkbox) {
+    const isTurningOn = checkbox.checked;
+    const status = document.getElementById(`stream-status`);
+    const slider = checkbox.nextElementSibling;
+
+    checkbox.disabled = true;
+    checkbox.dataset.busy = "true";
+
+    if (isTurningOn) {
+        if (status) {
+            status.textContent = "CONN...";
+        }
+        if (slider) {
+            slider.style.backgroundColor = "orange";
+        }
+    } else {
+        if (status) status.textContent = "OFF...";
+    }
+
     const ok = await _apiPost("/api/toggle_stream");
+
+    // Reset styles
+    if (slider) slider.style.backgroundColor = "";
+
     if (!ok) {
-        checkbox.checked = !checkbox.checked;
+        checkbox.checked = !isTurningOn;
+        checkbox.disabled = false;
+        delete checkbox.dataset.busy;
+        if (status) {
+            status.textContent = checkbox.checked ? "ON" : "OFF";
+            status.classList.toggle("on", checkbox.checked);
+        }
         _blurToggle(checkbox);
         return;
     }
+
+    // Override local element disabled to allow _setToggle to update
+    checkbox.disabled = false;
+    delete checkbox.dataset.busy;
     _setToggle("stream", ok.active);
     addLocalLog(ok.active ? "success" : "warning", ok.message);
 
@@ -315,6 +418,49 @@ async function toggleKeyboardMode(checkbox) {
     
     addLocalLog("system", ui.keyboardMode ? "Modalità di controllo RC da tastiera ATTIVATA" : "Modalità di controllo RC da tastiera DISATTIVATA");
     _blurToggle(checkbox);
+}
+
+/**
+ * Toggle Parser Takeoff (allow speech/chat to execute takeoff)
+ */
+async function toggleParserTakeoff(checkbox) {
+    const active = checkbox.checked;
+    const status = document.getElementById("parser-takeoff-status");
+    if (status) {
+        status.textContent = active ? "ON" : "OFF";
+        status.classList.toggle("on", active);
+    }
+    
+    try {
+        await fetch("/api/toggle_parser_takeoff", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ active: active })
+        });
+    } catch(err) {
+        console.error("Errore notifica parser takeoff", err);
+    }
+    addLocalLog("system", active ? "Takeoff da Parser SBLOCCATO" : "Takeoff da Parser BLOCCATO");
+    _blurToggle(checkbox);
+}
+
+/**
+ * Invia Comando Diretto (UI Button)
+ */
+async function sendDirectCommand(cmdName) {
+    try {
+        const res = await fetch("/api/command", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ command: cmdName, argument: null })
+        });
+        const data = await res.json();
+        if (data && !data.success) {
+            addLocalLog("error", data.message || "Errore invio comando");
+        }
+    } catch(err) {
+        addLocalLog("error", `Errore invio comando diretto: ${err.message}`);
+    }
 }
 
 /**
@@ -645,8 +791,14 @@ async function _startVoiceRecognition() {
         };
 
         ui.voiceSocket.onerror = (error) => {
-            addLocalLog("error", "Errore WebSocket vocale");
-            console.error("[voice] WebSocket error:", error);
+            console.error("[voice] WebSocket error inatteso:", error);
+            // Ignoriamo l'errore rosso quando avviene durante lo switch volontario del Wi-Fi
+            const wifiCheckbox = document.getElementById("wifi-toggle");
+            if (wifiCheckbox && wifiCheckbox.dataset.busy === "true") {
+                console.warn("[voice] Disconnesso a causa del cambio di rete Wi-Fi");
+            } else {
+                addLocalLog("warning", "Disconnessione WebSocket vocale");
+            }
             _stopVoiceRecognition();
         };
 
@@ -804,6 +956,13 @@ async function _apiPost(url) {
         }
         return data;
     } catch (err) {
+        // Quando il PC cambia rete (e passa offline/online o salta per l'aggancio al drone)
+        // il browser tronca brutalmente la chiamata HTTP attiva con un "Failed to fetch".
+        if (url.includes("toggle_wifi") && (err.message.toLowerCase().includes("fetch") || err.message.toLowerCase().includes("network"))) {
+            console.warn(`[Network] fetch abortita (fisiologico al cambio Wi-Fi): ${err.message}`);
+            return { pending_wifi_switch: true };
+        }
+        
         addLocalLog("error", `Errore di rete (${url}): ${err.message}`);
         return null;
     }

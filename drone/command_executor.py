@@ -162,6 +162,7 @@ class CommandExecutor:
         self,
         command:  str,
         argument: Optional[int] = None,
+        source: str = "manual",
     ) -> Tuple[bool, str]:
         """
         Esegue il comando indicato con l'argomento opzionale.
@@ -205,6 +206,7 @@ class CommandExecutor:
             effective_arg=effective_arg,
             unit=entry["unit"],
             signature=signature,
+            source=source,
         )
         if skip_duplicate:
             print(f"[command_executor] {skip_message}")
@@ -286,16 +288,17 @@ class CommandExecutor:
         effective_arg: Optional[int],
         unit: str,
         signature: tuple[str, Optional[int]],
+        source: str,
     ) -> tuple[bool, str, bool]:
         """
-        Gestisce deduplica concorrente:
+        Gestisce deduplica concorrente solo per OCR:
         - blocca duplicati gia' in esecuzione
         - blocca duplicati appena eseguiti nella finestra configurata
 
         Returns:
             (skip, message, guard_active)
         """
-        if self._dedupe_window_seconds <= 0:
+        if self._dedupe_window_seconds <= 0 or str(source).lower() != "ocr":
             return False, "", False
 
         if canonical in self._dedupe_exempt_commands:
@@ -392,13 +395,19 @@ class CommandExecutor:
                 self._is_flying = False
             return False
 
-        # Se SDK dice in volo, prova a validare con altezza reale.
+        # Se SDK dice in volo, prova a validare con altezza reale e TOF.
         # In caso di errore telemetria, mantieni lo stato SDK.
         confirmed_flying = True
         
         try:
             height = tello.get_height()
-            if height is not None and height <= 10:
+            tof = tello.get_distance_tof()
+            
+            # Se sia altezza che TOF sono molto bassi, probabile sia a terra.
+            if height is not None and tof is not None:
+                if height <= 10 and tof <= 10:
+                    confirmed_flying = False
+            elif height is not None and height <= 10:
                 confirmed_flying = False
         except Exception:
             pass
@@ -473,7 +482,7 @@ class CommandExecutor:
             f"[command_executor] OCR match -> comando={best_match} "
             f"argomento={parsed_argument}"
         )
-        return self.run(best_match, parsed_argument)
+        return self.run(best_match, parsed_argument, source="ocr")
 
     def available_commands(self) -> list:
         """
