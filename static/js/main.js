@@ -36,6 +36,9 @@ const ui = {
     /** ScriptProcessorNode for audio processing */
     audioProcessor: null,
 
+    /** Minimum RMS volume required to forward audio to Vosk */
+    voiceMinInputRms: 0.02,
+
     /** Prevent overlapping /api/send_message calls */
     isSendingMessage: false,
 
@@ -700,6 +703,8 @@ async function _startVoiceRecognition() {
             throw new Error("API MediaDevices non disponibile. Usa localhost o HTTPS.");
         }
 
+        ui.voiceMinInputRms = await _loadVoiceInputRmsThreshold();
+
         // Richiedi accesso al microfono
         ui.micStream = await navigator.mediaDevices.getUserMedia({ 
             audio: {
@@ -723,13 +728,15 @@ async function _startVoiceRecognition() {
             // Converti Float32 a Int16 PCM (formato richiesto da Vosk)
             const inputData = e.inputBuffer.getChannelData(0);
             
-            // Noise gate: riduce sensibilità, invia solo quando si parla (~>0.02 amplitude rms)
+            // Noise gate: volume minimo richiesto prima di inviare audio a Vosk.
+            // Più alto = serve parlare più forte; più basso = più sensibile al rumore.
             let sum = 0;
             for (let i = 0; i < inputData.length; i++) {
-                sum += Math.abs(inputData[i]);
+                sum += inputData[i] * inputData[i];
             }
             const rms = Math.sqrt(sum / inputData.length);
-            if (rms < 0.02) {
+            const minRms = Number.isFinite(ui.voiceMinInputRms) ? ui.voiceMinInputRms : 0.02;
+            if (rms < minRms) {
                 // Silenzio, non inviamo per non catturare rumore di sottofondo e click del mouse
                 return;
             }
@@ -812,6 +819,31 @@ async function _startVoiceRecognition() {
         console.error("[voice] Errore:", err);
         _stopVoiceRecognition();
     }
+}
+
+/**
+ * Load the minimum input volume threshold for Vosk from the runtime config.
+ * Falls back to 0.02 if the config endpoint is unavailable.
+ */
+async function _loadVoiceInputRmsThreshold() {
+    try {
+        const res = await fetch("/api/config");
+        if (!res.ok) {
+            return 0.02;
+        }
+
+        const data = await res.json();
+        const config = data && data.config ? data.config : {};
+        const threshold = Number.parseFloat(config.VOICE_MIN_INPUT_RMS);
+
+        if (Number.isFinite(threshold)) {
+            return Math.max(0, Math.min(1, threshold));
+        }
+    } catch (err) {
+        console.warn("[voice] Impossibile caricare VOICE_MIN_INPUT_RMS, uso il default 0.02:", err);
+    }
+
+    return 0.02;
 }
 
 /**
@@ -970,55 +1002,6 @@ async function _apiPost(url) {
 
 
 // ================================================================
-//  PUSH TO TALK  –  T key & Web Page Click
-// ================================================================
-
-let pushToTalkActive = false;
-
-function _isMutedTarget(element) {
-    if (!element) return false;
-    const tag = element.tagName;
-    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "BUTTON") return true;
-    if (element.closest && (element.closest(".settings-modal") || element.closest("button"))) return true;
-    if (element.id === "mic-btn") return true;
-    return false;
-}
-
-document.addEventListener("keydown", (event) => {
-    if (event.key.toLowerCase() === "t") {
-        if (_isMutedTarget(document.activeElement)) return;
-        if (!ui.isRecording && !pushToTalkActive) {
-            pushToTalkActive = true;
-            _startVoiceRecognition();
-        }
-    }
-});
-
-document.addEventListener("keyup", (event) => {
-    if (event.key.toLowerCase() === "t" && pushToTalkActive) {
-        pushToTalkActive = false;
-        _stopVoiceRecognition();
-    }
-});
-
-document.addEventListener("mousedown", (event) => {
-    if (_isMutedTarget(event.target)) return;
-    // Activate on middle or left click
-    if (!ui.isRecording && !pushToTalkActive) {
-        pushToTalkActive = true;
-        _startVoiceRecognition();
-    }
-});
-
-document.addEventListener("mouseup", (event) => {
-    if (pushToTalkActive) {
-        pushToTalkActive = false;
-        _stopVoiceRecognition();
-    }
-});
-
-
-// ================================================================
 //  SETTINGS MODAL  –  configuration management
 // ================================================================
 
@@ -1112,6 +1095,9 @@ async function openSettingsModal() {
                 if (key.includes("SPEED") || key.includes("QUALITY")) {
                     input.min = "0";
                     input.max = "100";
+                } else if (key.includes("CONFIDENCE") || key.includes("RMS")) {
+                    input.min = "0";
+                    input.max = "1";
                 } else if (key === "LOG_MAX_ENTRIES") {
                     input.min = "0";
                     input.max = "100";

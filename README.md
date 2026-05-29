@@ -83,6 +83,14 @@ OCR_JPEG_QUALITY=85
 OCR_MIN_CONFIDENCE=0.0
 
 # ─────────────────────────────────────────────────────────────────────
+# VOICE - Filtro volume microfono per Vosk
+# ─────────────────────────────────────────────────────────────────────
+VOICE_MIN_INPUT_RMS=0.02            # soglia minima del volume prima di inviare audio a Vosk
+VOICE_MIN_FINAL_CHARS=4             # lunghezza minima del testo finale riconosciuto
+VOICE_MIN_AVG_CONFIDENCE=0.82       # confidenza media minima per accettare la trascrizione
+VOICE_DEDUPE_WINDOW_SECONDS=2.2     # finestra anti-duplicato per la stessa frase
+
+# ─────────────────────────────────────────────────────────────────────
 # OLLAMA - Modello AI per processamento OCR (opzionale)
 # ─────────────────────────────────────────────────────────────────────
 OLLAMA_URL=http://127.0.0.1:11434
@@ -208,7 +216,7 @@ La dashboard è divisa in due sezioni:
 
 3. **Invia comandi**
    - **Manualmente:** Scrivi nell'input testuale (es. "takeoff", "move_forward 50") e premi invio o clicca il bottone
-   - **Vocale (Vosk):** Usa l'apposito modulo integrato offline per impartire comandi naturali in italiano
+  - **Vocale (Vosk):** Usa l'apposito modulo integrato offline per impartire comandi naturali in italiano; la sensibilità d'ingresso si regola con `VOICE_MIN_INPUT_RMS` nel `.env`
    - **Automatico:** Attiva "OCR" per inviare frame al server remoto e generare azioni tramite Ollama
 
 4. **Monitora l'esecuzione**

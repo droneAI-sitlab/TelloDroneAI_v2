@@ -505,12 +505,12 @@ def enqueue_executor_commands(commands: list[tuple[str, int | None]], source: st
     for command_name, argument in commands:
         normalized = _normalize_command_key(command_name)
         
-        # Se il parser takeoff e' disabilitato, rifiuta i comandi di decollo derivati da chat, ocr, mic, ecc. (tutto tranne il tasto web)
+        # Se il lock decollo e' abilitato (True), rifiuta i comandi di decollo derivati da chat, ocr, mic, ecc.
         if normalized == "takeoff" and source != "web":
             with _state_lock:
-                allow_takeoff = app_state.get("allow_parser_takeoff", False)
-            if not allow_takeoff:
-                add_log(f"Comando {normalized} rifiutato ({source}) - Sblocca prima il Parser Takeoff", "warning")
+                lock_takeoff = app_state.get("allow_parser_takeoff", False)
+            if lock_takeoff:
+                add_log(f"Comando {normalized} rifiutato ({source}) - Lock decollo attivo, disattivalo per permettere", "warning")
                 continue
 
         if apply_dedupe:
@@ -882,7 +882,7 @@ def toggle_parser_takeoff():
         app_state["allow_parser_takeoff"] = active
 
     add_log(
-        "Takeoff da Parser SBLOCCATO" if active else "Takeoff da Parser BLOCCATO",
+        "Lock Decollo ATTIVATO (Blocca)" if active else "Lock Decollo DISATTIVATO (Permetti)",
         "system",
     )
     return jsonify({"success": True, "active": active, "message": "ok"})
@@ -1441,6 +1441,10 @@ def get_config():
         "COMMAND_BUFFER_MAX_SIZE": "Dimensione massima coda comandi (default: 50)",
         "KEEPALIVE_COOLDOWN_SECONDS": "Cooldown tra keepalive consecutivi quando buffer vuoto (default: 5.0)",
         "KEEPALIVE_USE_NO_RESPONSE": "Se true usa send_command_without_return('keepalive') invece di attendere risposta 'ok'",
+        "VOICE_MIN_INPUT_RMS": "Soglia minima del volume audio del microfono prima di inviare a Vosk (0.0-1.0, default: 0.02; più alto = serve parlare più forte)",
+        "VOICE_MIN_FINAL_CHARS": "Lunghezza minima del testo finale Vosk in caratteri (default: 4; più alto = meno rumore)",
+        "VOICE_MIN_AVG_CONFIDENCE": "Soglia media di confidenza Vosk (0.0-1.0, default: 0.7; più alto = meno sensibilità)",
+        "VOICE_DEDUPE_WINDOW_SECONDS": "Finestra anti-duplicato Vosk per la stessa frase nella sessione (secondi, default: 2.0)",
         "MEDIA_OUTPUT_DIR": "Directory dove salvare foto/video (default: captures)",
         "MEDIA_VIDEO_FPS": "FPS di registrazione video (default: 20.0)",
         "MEDIA_VIDEO_CODEC": "Codec FourCC video (default: mp4v)",
