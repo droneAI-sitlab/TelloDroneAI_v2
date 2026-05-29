@@ -36,9 +36,6 @@ const ui = {
     /** ScriptProcessorNode for audio processing */
     audioProcessor: null,
 
-    /** Minimum RMS volume required to forward audio to Vosk */
-    voiceMinInputRms: 0.02,
-
     /** Prevent overlapping /api/send_message calls */
     isSendingMessage: false,
 
@@ -703,8 +700,6 @@ async function _startVoiceRecognition() {
             throw new Error("API MediaDevices non disponibile. Usa localhost o HTTPS.");
         }
 
-        ui.voiceMinInputRms = await _loadVoiceInputRmsThreshold();
-
         // Richiedi accesso al microfono
         ui.micStream = await navigator.mediaDevices.getUserMedia({ 
             audio: {
@@ -720,26 +715,63 @@ async function _startVoiceRecognition() {
         const source = ui.audioContext.createMediaStreamSource(ui.micStream);
 
         // Crea ScriptProcessor per catturare e convertire l'audio
-        ui.audioProcessor = ui.audioContext.createScriptProcessor(4096, 1, 1);
+        // Buffer più piccolo riduce la latenza nella pipeline (più callback frequenti)
+        ui.audioProcessor = ui.audioContext.createScriptProcessor(2048, 1, 1);
         
+        // Silence timeout and gate (configurable via .env exposed by /api/config)
+        let voiceConfig = {
+            silenceTimeoutSec: 0.9, // default: send final after 0.9s of silence
+            minInputRms: 0.02       // default noise gate
+        };
+
+        // Track last time audio exceeded threshold
+        let _lastSpokenAt = null;
+        let _flushPending = false;
+
+        // Try to load runtime config (non-blocking)
+        fetch('/api/config').then(r => r.json()).then(cfg => {
+            try {
+                const c = cfg.config || {};
+                if (c.VOICE_SILENCE_TIMEOUT) voiceConfig.silenceTimeoutSec = parseFloat(c.VOICE_SILENCE_TIMEOUT) || voiceConfig.silenceTimeoutSec;
+                if (c.VOICE_MIN_INPUT_RMS) voiceConfig.minInputRms = parseFloat(c.VOICE_MIN_INPUT_RMS) || voiceConfig.minInputRms;
+            } catch (e) {
+                // ignore
+            }
+        }).catch(() => {});
+
+        // Periodic checker that will send a 'flush' command when sufficient silence detected
+        const _silenceChecker = setInterval(() => {
+            if (!ui.voiceSocket || ui.voiceSocket.readyState !== WebSocket.OPEN) return;
+            if (!_lastSpokenAt) return;
+            const since = (performance.now() - _lastSpokenAt) / 1000.0;
+            if (!_flushPending && since >= (voiceConfig.silenceTimeoutSec || 0.9)) {
+                try {
+                    ui.voiceSocket.send(JSON.stringify({ cmd: 'flush' }));
+                    _flushPending = true; // avoid spamming flush
+                } catch (e) {}
+            }
+        }, 200);
+
         ui.audioProcessor.onaudioprocess = (e) => {
             if (!ui.voiceSocket || ui.voiceSocket.readyState !== WebSocket.OPEN) return;
             
             // Converti Float32 a Int16 PCM (formato richiesto da Vosk)
             const inputData = e.inputBuffer.getChannelData(0);
             
-            // Noise gate: volume minimo richiesto prima di inviare audio a Vosk.
-            // Più alto = serve parlare più forte; più basso = più sensibile al rumore.
+            // Noise gate: riduce sensibilità, invia solo quando si parla
             let sum = 0;
             for (let i = 0; i < inputData.length; i++) {
-                sum += inputData[i] * inputData[i];
+                sum += Math.abs(inputData[i]);
             }
             const rms = Math.sqrt(sum / inputData.length);
-            const minRms = Number.isFinite(ui.voiceMinInputRms) ? ui.voiceMinInputRms : 0.02;
-            if (rms < minRms) {
-                // Silenzio, non inviamo per non catturare rumore di sottofondo e click del mouse
+            if (rms < (voiceConfig.minInputRms || 0.02)) {
+                // Silence: update flush checker only if we had recent speech
                 return;
             }
+
+            // Mark that we recently had speech and clear pending flush
+            _lastSpokenAt = performance.now();
+            _flushPending = false;
 
             const pcmData = new Int16Array(inputData.length);
             
@@ -752,6 +784,9 @@ async function _startVoiceRecognition() {
             // Invia i dati PCM al backend via WebSocket
             ui.voiceSocket.send(pcmData.buffer);
         };
+
+        // When stopping, clear the interval
+        ui._voice_silence_interval = _silenceChecker;
 
         source.connect(ui.audioProcessor);
         ui.audioProcessor.connect(ui.audioContext.destination);
@@ -822,31 +857,6 @@ async function _startVoiceRecognition() {
 }
 
 /**
- * Load the minimum input volume threshold for Vosk from the runtime config.
- * Falls back to 0.02 if the config endpoint is unavailable.
- */
-async function _loadVoiceInputRmsThreshold() {
-    try {
-        const res = await fetch("/api/config");
-        if (!res.ok) {
-            return 0.02;
-        }
-
-        const data = await res.json();
-        const config = data && data.config ? data.config : {};
-        const threshold = Number.parseFloat(config.VOICE_MIN_INPUT_RMS);
-
-        if (Number.isFinite(threshold)) {
-            return Math.max(0, Math.min(1, threshold));
-        }
-    } catch (err) {
-        console.warn("[voice] Impossibile caricare VOICE_MIN_INPUT_RMS, uso il default 0.02:", err);
-    }
-
-    return 0.02;
-}
-
-/**
  * Stop voice recognition and cleanup resources.
  */
 function _stopVoiceRecognition() {
@@ -879,6 +889,12 @@ function _stopVoiceRecognition() {
             ui.audioContext.close();
         } catch (e) {}
         ui.audioContext = null;
+    }
+
+    // Clear silence checker interval if present
+    if (ui._voice_silence_interval) {
+        try { clearInterval(ui._voice_silence_interval); } catch (e) {}
+        ui._voice_silence_interval = null;
     }
 
     // Aggiorna UI
@@ -1095,9 +1111,6 @@ async function openSettingsModal() {
                 if (key.includes("SPEED") || key.includes("QUALITY")) {
                     input.min = "0";
                     input.max = "100";
-                } else if (key.includes("CONFIDENCE") || key.includes("RMS")) {
-                    input.min = "0";
-                    input.max = "1";
                 } else if (key === "LOG_MAX_ENTRIES") {
                     input.min = "0";
                     input.max = "100";
