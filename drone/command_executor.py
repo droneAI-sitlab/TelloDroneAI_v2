@@ -27,6 +27,7 @@ import os
 import re
 import threading
 import time
+import json
 from typing import Optional, Tuple
 
 from drone.frame_reader import DroneReader
@@ -43,7 +44,7 @@ def _send_keepalive_without_return(tello, _):
 
 
 ########################################################################
-#  COSTANTI
+#  COSTANTI E CARICAMENTO MAPPA COMANDI
 ########################################################################
 
 # Limiti SDK djitellopy per move_* (cm) e rotate_* (°)
@@ -54,215 +55,54 @@ _ANGLE_MAX: int = 360
 _SPEED_MIN: int = 10
 _SPEED_MAX: int = 100
 
-# Argomenti di default quando il chiamante non ne fornisce uno
-_DEFAULT_MOVE:  int = 30   # cm
-_DEFAULT_ANGLE: int = 90   # gradi
-_DEFAULT_SPEED: int = int(os.getenv("DRONE_SPEED", 30))   # cm/s
-
 # Priorita' coda comandi (numero minore = precedenza maggiore)
 # Nuovo sistema a 3 livelli: 2=emergency(max), 1=normali, 0=keepalive(min)
-COMMAND_PRIORITY_EMERGENCY: int = 0   # priorita' 2 → valore coda 0
-COMMAND_PRIORITY_NORMAL: int = 1      # priorita' 1 → valore coda 1  
-COMMAND_PRIORITY_KEEPALIVE: int = 2   # priorita' 0 → valore coda 2
+COMMAND_PRIORITY_EMERGENCY: int = 0
+COMMAND_PRIORITY_NORMAL: int = 1  
+COMMAND_PRIORITY_KEEPALIVE: int = 2
 
 
-########################################################################
-#  TABELLA COMANDI
-#
-#  Chiave  : nome canonico del comando (stringa, case-insensitive in run())
-#  "fn"    : lambda(tello, arg) → chiamata SDK; arg è già validato
-#  "default": valore usato quando argument=None
-#  "unit"  : unità per i messaggi di log
-#  "desc"  : descrizione breve
-########################################################################
-
-COMMAND_TABLE: dict = {
-    # ── Decollo / atterraggio ──────────────────────────────────────────
-    "takeoff": {
-        "fn":      lambda t, _: t.takeoff(),
-        "default": None,
-        "unit":    "",
-        "desc":    "Decolla",
-    },
-    "land": {
-        "fn":      lambda t, _: t.land(),
-        "default": None,
-        "unit":    "",
-        "desc":    "Atterra",
-    },
-    "emergency": {
-        "fn":      lambda t, _: t.emergency(),
-        "default": None,
-        "unit":    "",
-        "desc":    "Arresto motori immediato (emergenza)",
-    },
-
-    # ── Movimenti traslazionali ────────────────────────────────────────
-    "move_forward": {
-        "fn":      lambda t, arg: t.move_forward(arg),
-        "default": _DEFAULT_MOVE,
-        "unit":    "cm",
-        "desc":    "Avanza",
-    },
-    "move_back": {
-        "fn":      lambda t, arg: t.move_back(arg),
-        "default": _DEFAULT_MOVE,
-        "unit":    "cm",
-        "desc":    "Arretra",
-    },
-    "move_left": {
-        "fn":      lambda t, arg: t.move_left(arg),
-        "default": _DEFAULT_MOVE,
-        "unit":    "cm",
-        "desc":    "Trasla a sinistra",
-    },
-    "move_right": {
-        "fn":      lambda t, arg: t.move_right(arg),
-        "default": _DEFAULT_MOVE,
-        "unit":    "cm",
-        "desc":    "Trasla a destra",
-    },
-    "move_up": {
-        "fn":      lambda t, arg: t.move_up(arg),
-        "default": _DEFAULT_MOVE,
-        "unit":    "cm",
-        "desc":    "Sali",
-    },
-    "move_down": {
-        "fn":      lambda t, arg: t.move_down(arg),
-        "default": _DEFAULT_MOVE,
-        "unit":    "cm",
-        "desc":    "Scendi",
-    },
-
-    # ── Rotazioni ─────────────────────────────────────────────────────
-    "rotate_cw": {
-        "fn":      lambda t, arg: t.rotate_clockwise(arg),
-        "default": _DEFAULT_ANGLE,
-        "unit":    "°",
-        "desc":    "Ruota in senso orario",
-    },
-    "rotate_ccw": {
-        "fn":      lambda t, arg: t.rotate_counter_clockwise(arg),
-        "default": _DEFAULT_ANGLE,
-        "unit":    "°",
-        "desc":    "Ruota in senso antiorario",
-    },
-
-    # ── Flip ──────────────────────────────────────────────────────────
-    "flip_forward": {
-        "fn":      lambda t, _: t.flip_forward(),
-        "default": None,
-        "unit":    "",
-        "desc":    "Capriola in avanti",
-    },
-    "flip_back": {
-        "fn":      lambda t, _: t.flip_back(),
-        "default": None,
-        "unit":    "",
-        "desc":    "Capriola indietro",
-    },
-    "flip_left": {
-        "fn":      lambda t, _: t.flip_left(),
-        "default": None,
-        "unit":    "",
-        "desc":    "Capriola a sinistra",
-    },
-    "flip_right": {
-        "fn":      lambda t, _: t.flip_right(),
-        "default": None,
-        "unit":    "",
-        "desc":    "Capriola a destra",
-    },
-
-    # ── Velocità ──────────────────────────────────────────────────────
-    "set_speed": {
-        "fn":      lambda t, arg: t.set_speed(arg),
-        "default": _DEFAULT_SPEED,
-        "unit":    "cm/s",
-        "desc":    "Imposta velocità massima",
-    },
-
-    # ── Telemetria / keepalive ───────────────────────────────────────
-    "send_keepalive": {
-        "fn":      lambda t, _: t.send_keepalive(),
-        "default": None,
-        "unit":    "",
-        "desc":    "Invia heartbeat per mantenere la sessione attiva",
-    },
-    "send_keepalive_no_response": {
-        "fn":      _send_keepalive_without_return,
-        "default": None,
-        "unit":    "",
-        "desc":    "Invia heartbeat senza attendere risposta SDK",
-    },
-    "get_battery": {
-        "fn":      lambda t, _: t.get_battery(),
-        "default": None,
-        "unit":    "%",
-        "desc":    "Legge la batteria del drone",
-    },
-
-    # ── Media capture ────────────────────────────────────────────────
-    "take_photo": {
-        "fn":      lambda t, _: None,
-        "default": None,
-        "unit":    "",
-        "desc":    "Scatta una foto dalla camera del drone",
-    },
-    "start_video_recording": {
-        "fn":      lambda t, _: None,
-        "default": None,
-        "unit":    "",
-        "desc":    "Avvia registrazione video dalla camera del drone",
-    },
-    "stop_video_recording": {
-        "fn":      lambda t, _: None,
-        "default": None,
-        "unit":    "",
-        "desc":    "Ferma registrazione video e salva il file",
-    },
+_FUNCTIONS_MAP = {
+    "takeoff": lambda t, _: t.takeoff(),
+    "land": lambda t, _: t.land(),
+    "emergency": lambda t, _: t.emergency(),
+    "move_forward": lambda t, arg: t.move_forward(arg),
+    "move_back": lambda t, arg: t.move_back(arg),
+    "move_left": lambda t, arg: t.move_left(arg),
+    "move_right": lambda t, arg: t.move_right(arg),
+    "move_up": lambda t, arg: t.move_up(arg),
+    "move_down": lambda t, arg: t.move_down(arg),
+    "rotate_cw": lambda t, arg: t.rotate_clockwise(arg),
+    "rotate_ccw": lambda t, arg: t.rotate_counter_clockwise(arg),
+    "flip_forward": lambda t, _: t.flip_forward(),
+    "flip_back": lambda t, _: t.flip_back(),
+    "flip_left": lambda t, _: t.flip_left(),
+    "flip_right": lambda t, _: t.flip_right(),
+    "set_speed": lambda t, arg: t.set_speed(arg),
+    "send_keepalive": lambda t, _: t.send_keepalive(),
+    "send_keepalive_no_response": _send_keepalive_without_return,
 }
 
-# ── Alias: parole italiane / inglesi alternative → nome canonico ──────
-_ALIASES: dict = {
-    # italiano
-    "decolla":        "takeoff",
-    "atterra":        "land",
-    "emergenza":      "emergency",
-    "avanti":         "move_forward",
-    "indietro":       "move_back",
-    "dietro":         "move_back",
-    "sinistra":       "move_left",
-    "destra":         "move_right",
-    "su":             "move_up",
-    "sali":           "move_up",
-    "giu":            "move_down",
-    "scendi":         "move_down",
-    "ruota_destra":   "rotate_cw",
-    "ruota_sinistra": "rotate_ccw",
-    "velocita":       "set_speed",
-    # inglese alternativo
-    "forward":        "move_forward",
-    "back":           "move_back",
-    "backward":       "move_back",
-    "left":           "move_left",
-    "right":          "move_right",
-    "up":             "move_up",
-    "down":           "move_down",
-    "stop":           "emergency",
-    "keepalive":      "send_keepalive",
-    "keepalive_no_response": "send_keepalive_no_response",
-    "keepalive_nr":   "send_keepalive_no_response",
-    "battery":        "get_battery",
-    "foto":           "take_photo",
-    "photo":          "take_photo",
-    "scatta_foto":    "take_photo",
-    "avvia_video":    "start_video_recording",
-    "start_video":    "start_video_recording",
-    "stop_video":     "stop_video_recording",
-    "ferma_video":    "stop_video_recording",
-}
+COMMAND_TABLE: dict = {}
+_ALIASES: dict = {}
+
+_json_path = os.path.join(os.path.dirname(__file__), "commands.json")
+try:
+    with open(_json_path, "r", encoding="utf-8") as f:
+        _commands_data = json.load(f)
+        
+    for cmd_id, info in _commands_data.items():
+        if cmd_id in _FUNCTIONS_MAP:
+            COMMAND_TABLE[cmd_id] = {
+                "fn": _FUNCTIONS_MAP[cmd_id],
+                "default": info.get("default"),
+                "unit": info.get("unit", ""),
+                "desc": info.get("desc", "")
+            }
+            for alias in info.get("aliases", []):
+                _ALIASES[alias] = cmd_id
+except Exception as e:
+    print(f"[command_executor] Errore nel caricamento di {_json_path}: {e}")
 
 
 ########################################################################
@@ -322,6 +162,7 @@ class CommandExecutor:
         self,
         command:  str,
         argument: Optional[int] = None,
+        source: str = "manual",
     ) -> Tuple[bool, str]:
         """
         Esegue il comando indicato con l'argomento opzionale.
@@ -365,6 +206,7 @@ class CommandExecutor:
             effective_arg=effective_arg,
             unit=entry["unit"],
             signature=signature,
+            source=source,
         )
         if skip_duplicate:
             print(f"[command_executor] {skip_message}")
@@ -446,16 +288,17 @@ class CommandExecutor:
         effective_arg: Optional[int],
         unit: str,
         signature: tuple[str, Optional[int]],
+        source: str,
     ) -> tuple[bool, str, bool]:
         """
-        Gestisce deduplica concorrente:
+        Gestisce deduplica concorrente solo per OCR:
         - blocca duplicati gia' in esecuzione
         - blocca duplicati appena eseguiti nella finestra configurata
 
         Returns:
             (skip, message, guard_active)
         """
-        if self._dedupe_window_seconds <= 0:
+        if self._dedupe_window_seconds <= 0 or str(source).lower() != "ocr":
             return False, "", False
 
         if canonical in self._dedupe_exempt_commands:
@@ -552,13 +395,19 @@ class CommandExecutor:
                 self._is_flying = False
             return False
 
-        # Se SDK dice in volo, prova a validare con altezza reale.
+        # Se SDK dice in volo, prova a validare con altezza reale e TOF.
         # In caso di errore telemetria, mantieni lo stato SDK.
         confirmed_flying = True
         
         try:
             height = tello.get_height()
-            if height is not None and height <= 10:
+            tof = tello.get_distance_tof()
+            
+            # Se sia altezza che TOF sono molto bassi, probabile sia a terra.
+            if height is not None and tof is not None:
+                if height <= 10 and tof <= 10:
+                    confirmed_flying = False
+            elif height is not None and height <= 10:
                 confirmed_flying = False
         except Exception:
             pass
@@ -633,7 +482,7 @@ class CommandExecutor:
             f"[command_executor] OCR match -> comando={best_match} "
             f"argomento={parsed_argument}"
         )
-        return self.run(best_match, parsed_argument)
+        return self.run(best_match, parsed_argument, source="ocr")
 
     def available_commands(self) -> list:
         """

@@ -8,13 +8,8 @@
     <!-- ── Stylesheet ─────────────────────────────────────────────── -->
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}" />
 
-    <!-- ── Font Awesome icons (CDN) ──────────────────────────────── -->
-    <link
-        rel="stylesheet"
-        href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"
-        crossorigin="anonymous"
-        referrerpolicy="no-referrer"
-    />
+    <!-- ── Font Awesome icons (Local) ────────────────────────────── -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/all.min.css') }}" />
 </head>
 
 <body>
@@ -128,6 +123,38 @@
                     <span class="toggle-switch__slider"></span>
                 </label>
                 <span class="toggle-item__status" id="keyboard-status">OFF</span>
+            </div>
+
+            <!-- Block Takeoff from Parser toggle -->
+            <div class="toggle-item">
+                <span class="toggle-item__label">
+                    <i class="fas fa-lock"></i> Lock Decollo
+                </span>
+                <label class="toggle-switch">
+                    <input
+                        type="checkbox"
+                        id="parser-takeoff-toggle"
+                        onchange="toggleParserTakeoff(this)"
+                    />
+                    <span class="toggle-switch__slider"></span>
+                </label>
+                <span class="toggle-item__status" id="parser-takeoff-status">OFF</span>
+            </div>
+
+            <!-- Separator -->
+            <div class="controls-separator" style="width: 1px; background: var(--clr-border); height: 40px; margin: 0 10px;"></div>
+
+            <!-- Direct Action Controls -->
+            <div class="media-controls" style="display: flex; gap: 12px; align-items: center;">
+                <button class="btn-media" id="btn-takeoff" onclick="sendDirectCommand('takeoff')" title="Decollo">
+                    <i class="fas fa-arrow-up"></i>
+                </button>
+                <button class="btn-media" id="btn-land" onclick="sendDirectCommand('land')" title="Atterraggio">
+                    <i class="fas fa-arrow-down"></i>
+                </button>
+                <button class="btn-media" id="btn-emergency" onclick="sendDirectCommand('emergency')" title="Emergenza" style="background: #ffebee; color: #dc3545; border-color: #f5c6cb;">
+                    <i class="fas fa-exclamation-triangle"></i>
+                </button>
             </div>
 
             <!-- Separator -->

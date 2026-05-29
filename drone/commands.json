@@ -1,0 +1,110 @@
+{
+  "takeoff": {
+    "desc": "Decolla",
+    "unit": "",
+    "default": null,
+    "aliases": ["decolla"]
+  },
+  "land": {
+    "desc": "Atterra",
+    "unit": "",
+    "default": null,
+    "aliases": ["atterra"]
+  },
+  "emergency": {
+    "desc": "Arresto motori immediato (emergenza)",
+    "unit": "",
+    "default": null,
+    "aliases": ["emergenza", "stop"]
+  },
+  "move_forward": {
+    "desc": "Avanza",
+    "unit": "cm",
+    "default": 30,
+    "aliases": ["avanti", "forward"]
+  },
+  "move_back": {
+    "desc": "Arretra",
+    "unit": "cm",
+    "default": 30,
+    "aliases": ["indietro", "dietro", "back", "backward"]
+  },
+  "move_left": {
+    "desc": "Trasla a sinistra",
+    "unit": "cm",
+    "default": 30,
+    "aliases": ["sinistra", "left"]
+  },
+  "move_right": {
+    "desc": "Trasla a destra",
+    "unit": "cm",
+    "default": 30,
+    "aliases": ["destra", "right"]
+  },
+  "move_up": {
+    "desc": "Sali",
+    "unit": "cm",
+    "default": 30,
+    "aliases": ["su", "sali", "up"]
+  },
+  "move_down": {
+    "desc": "Scendi",
+    "unit": "cm",
+    "default": 30,
+    "aliases": ["giu", "scendi", "down"]
+  },
+  "rotate_cw": {
+    "desc": "Ruota in senso orario",
+    "unit": "°",
+    "default": 90,
+    "aliases": ["ruota_destra"]
+  },
+  "rotate_ccw": {
+    "desc": "Ruota in senso antiorario",
+    "unit": "°",
+    "default": 90,
+    "aliases": ["ruota_sinistra"]
+  },
+  "flip_forward": {
+    "desc": "Capriola in avanti",
+    "unit": "",
+    "default": null,
+    "aliases": []
+  },
+  "flip_back": {
+    "desc": "Capriola indietro",
+    "unit": "",
+    "default": null,
+    "aliases": []
+  },
+  "flip_left": {
+    "desc": "Capriola a sinistra",
+    "unit": "",
+    "default": null,
+    "aliases": []
+  },
+  "flip_right": {
+    "desc": "Capriola a destra",
+    "unit": "",
+    "default": null,
+    "aliases": []
+  },
+  "set_speed": {
+    "desc": "Imposta velocità di volo",
+    "unit": "cm/s",
+    "default": 30,
+    "aliases": ["velocita", "speed"]
+  },
+  "send_keepalive": {
+    "desc": "Invia heartbeat per mantenere la sessione attiva",
+    "unit": "",
+    "default": null,
+    "aliases": ["keepalive"]
+  },
+  "send_keepalive_no_response": {
+    "desc": "Invia heartbeat senza attendere risposta SDK",
+    "unit": "",
+    "default": null,
+    "aliases": ["keepalive_no_response", "keepalive_nr"]
+  }
+}

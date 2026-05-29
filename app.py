@@ -47,6 +47,7 @@ from drone.ollama_client import (
     get_ollama_config,
 )
 from drone.command_executor import CommandExecutor
+from drone.chat_parser import parse_direct_command
 
 # ── Load environment variables from .env ──────────────────────────────
 # override=True evita che vecchie variabili di ambiente del processo
@@ -128,7 +129,7 @@ OCR_ENABLED = _env_bool("OCR_ENABLED", True)
 # (case-insensitive: "takeoff", "move_forward 50", "avanti 30")
 FUNCTIONGEMMA_ENABLED = _env_bool("FUNCTIONGEMMA_ENABLED", True)
 
-# ── Buffer comandi da FunctionGemma ───────────────────────────────────
+# ── Buffer comandi da FunctionGemma / OCR ─────────────────────────────
 COMMAND_BUFFER_DELAY_SECONDS = float(os.getenv("COMMAND_BUFFER_DELAY_SECONDS", "2.0"))
 COMMAND_BUFFER_MAX_SIZE = int(os.getenv("COMMAND_BUFFER_MAX_SIZE", "50"))
 # Keepalive cooldown timer (nuovo sistema a buffer singolo)
@@ -158,6 +159,7 @@ app_state: dict = {
     "wifi_connected": False,
     "stream_active":  False,
     "keyboard_mode":  False,
+    "allow_parser_takeoff": False,
     "battery":        0,       # 0-100 %
     "logs":           [],
     "fps":            0.0,     # FPS in tempo reale
@@ -232,7 +234,7 @@ PRIORITY_EMERGENCY = command_executor.emergency_priority_value()
 PRIORITY_NORMAL = command_executor.normal_priority_value()
 PRIORITY_KEEPALIVE = command_executor.keepalive_priority_value()
 
-command_buffer: queue.PriorityQueue[tuple[int, int, str, int | None]] = queue.PriorityQueue(
+command_buffer: queue.PriorityQueue[tuple[int, int, str, int | None, str]] = queue.PriorityQueue(
     maxsize=COMMAND_BUFFER_MAX_SIZE
 )
 
@@ -320,9 +322,10 @@ def _reload_runtime_config(changed_keys: set[str] | None = None) -> tuple[list[s
 
     LOG_MAX_ENTRIES = _env_int("LOG_MAX_ENTRIES", LOG_MAX_ENTRIES)
     DRONE_RC_SPEED = _env_int("DRONE_RC_SPEED", DRONE_RC_SPEED)
-    # Aggiorna anche velocità di the flight defaults
+    # Aggiorna anche velocità nei defaults della tabella dei comandi
     import drone.command_executor
-    drone.command_executor._DEFAULT_SPEED = _env_int("DRONE_SPEED", drone.command_executor._DEFAULT_SPEED)
+    if "set_speed" in drone.command_executor.COMMAND_TABLE:
+        drone.command_executor.COMMAND_TABLE["set_speed"]["default"] = _env_int("DRONE_SPEED", 30)
 
     DRONE_WIFI_SSID = os.getenv("DRONE_WIFI_SSID", DRONE_WIFI_SSID)
     WIFI_TIMEOUT = _env_int("WIFI_CONNECT_TIMEOUT", WIFI_TIMEOUT)
@@ -496,36 +499,47 @@ def enqueue_executor_commands(commands: list[tuple[str, int | None]], source: st
     Inserisce in coda tutti i comandi estratti dal modello, preservando l'ordine.
     """
     enqueued = 0
+    apply_dedupe = str(source).lower() == "ocr"
     batch_seen: set[tuple[str, int | None]] = set()
 
     for command_name, argument in commands:
         normalized = _normalize_command_key(command_name)
-        dedupe_key = (normalized, argument)
+        
+        # Se il lock decollo e' abilitato (True), rifiuta i comandi di decollo derivati da chat, ocr, mic, ecc.
+        if normalized == "takeoff" and source != "web":
+            with _state_lock:
+                lock_takeoff = app_state.get("allow_parser_takeoff", False)
+            if lock_takeoff:
+                add_log(f"Comando {normalized} rifiutato ({source}) - Lock decollo attivo, disattivalo per permettere", "warning")
+                continue
 
-        if dedupe_key in batch_seen:
-            msg = (
-                f"Duplicato batch ignorato ({source}): {normalized} "
-                f"{argument if argument is not None else ''}"
-            ).rstrip()
-            print(f"{ANSI_BUFFER}[app] {msg}{ANSI_RESET}")
-            add_log(msg, "warning")
-            continue
+        if apply_dedupe:
+            dedupe_key = (normalized, argument)
 
-        if _is_command_already_buffered(command_name, argument):
-            msg = (
-                f"Duplicato coda ignorato ({source}): {normalized} "
-                f"{argument if argument is not None else ''}"
-            ).rstrip()
-            print(f"{ANSI_BUFFER}[app] {msg}{ANSI_RESET}")
-            add_log(msg, "warning")
-            continue
+            if dedupe_key in batch_seen:
+                msg = (
+                    f"Duplicato batch ignorato ({source}): {normalized} "
+                    f"{argument if argument is not None else ''}"
+                ).rstrip()
+                print(f"{ANSI_BUFFER}[app] {msg}{ANSI_RESET}")
+                add_log(msg, "warning")
+                continue
 
-        batch_seen.add(dedupe_key)
+            if _is_command_already_buffered(command_name, argument):
+                msg = (
+                    f"Duplicato coda ignorato ({source}): {normalized} "
+                    f"{argument if argument is not None else ''}"
+                ).rstrip()
+                print(f"{ANSI_BUFFER}[app] {msg}{ANSI_RESET}")
+                add_log(msg, "warning")
+                continue
+
+            batch_seen.add(dedupe_key)
 
         try:
             priority = command_executor.get_command_priority(command_name)
             sequence = next(_command_sequence)
-            command_buffer.put_nowait((priority, sequence, command_name, argument))
+            command_buffer.put_nowait((priority, sequence, command_name, argument, source))
             enqueued += 1
             msg = (
                 f"Buffered command ({source}): {command_name} "
@@ -562,9 +576,9 @@ def _command_buffer_worker() -> None:
         
         if has_real_commands:
             # Estrai ed esegui comando dalla coda
-            _, _, command_name, argument = command_buffer.get()
+            _, _, command_name, argument, source = command_buffer.get()
             try:
-                ok_cmd, msg_cmd = command_executor.run(command_name, argument)
+                ok_cmd, msg_cmd = command_executor.run(command_name, argument, source=source)
                 if ok_cmd:
                     print(f"[app] Comando eseguito da buffer: {msg_cmd}")
                     add_log(f"Eseguito: {msg_cmd}", "success")
@@ -598,6 +612,13 @@ def _command_buffer_worker() -> None:
                 time.sleep(0.1)
                 continue
             
+            # Il keepalive serve principalmente quando il drone è in volo
+            # per evtare auto-landing per inattività.
+            is_flying = command_executor.is_flying()
+            if not is_flying:
+                time.sleep(0.1)
+                continue
+            
             # Controlla cooldown keepalive
             now = time.monotonic()
             with _keepalive_lock:
@@ -611,7 +632,7 @@ def _command_buffer_worker() -> None:
                         if KEEPALIVE_USE_NO_RESPONSE
                         else "send_keepalive"
                     )
-                    ok_cmd, msg_cmd = command_executor.run(keepalive_command, None)
+                    ok_cmd, msg_cmd = command_executor.run(keepalive_command, None, source="system")
                     if ok_cmd:
                         print(f"[app] Keepalive eseguito: {msg_cmd}")
                         add_log("Keepalive eseguito", "system")
@@ -619,7 +640,7 @@ def _command_buffer_worker() -> None:
                         print(f"[app] Keepalive fallito: {msg_cmd}")
                         add_log(f"Keepalive fallito: {msg_cmd}", "warning")
                         # Fallback get_battery
-                        ok_fb, msg_fb = command_executor.run("get_battery", None)
+                        ok_fb, msg_fb = command_executor.run("get_battery", None, source="system")
                         if ok_fb:
                             battery_level = drone_reader.get_battery()
                             with _state_lock:
@@ -849,6 +870,24 @@ def toggle_keyboard():
     return jsonify({"success": True, "active": active, "message": "ok"})
 
 
+@app.route("/api/toggle_parser_takeoff", methods=["POST"])
+def toggle_parser_takeoff():
+    """
+    Abilita o disabilita i comandi di takeoff provenienti dal parser di chat/voice.
+    """
+    data = request.get_json(silent=True) or {}
+    active = bool(data.get("active", False))
+
+    with _state_lock:
+        app_state["allow_parser_takeoff"] = active
+
+    add_log(
+        "Lock Decollo ATTIVATO (Blocca)" if active else "Lock Decollo DISATTIVATO (Permetti)",
+        "system",
+    )
+    return jsonify({"success": True, "active": active, "message": "ok"})
+
+
 @app.route("/api/rc", methods=["POST"])
 def rc_control():
     """
@@ -888,7 +927,7 @@ def rc_control():
 @app.route("/api/command", methods=["POST"])
 def execute_command():
     """
-    Esegue un comando sul drone tramite CommandExecutor.
+    Inserisce in coda un comando dal drone tramite CommandExecutor.
     Body JSON: {command: str, argument: int (opzionale)}
     Returns JSON: {success, message}
     """
@@ -906,9 +945,18 @@ def execute_command():
             return jsonify({"success": False, "message": "'argument' deve essere un intero"})
 
     add_log(f"Comando: {command}" + (f" {argument}" if argument is not None else ""), "user")
-    ok, msg = command_executor.run(command, argument)
-    add_log(msg, "success" if ok else "error")
-    return jsonify({"success": ok, "message": msg})
+    
+    # L'emergenza DEVE interrompere subito ignorando la coda e i blocchi del thread worker.
+    if _normalize_command_key(command) == "emergency":
+        # Avvia in un thread separato per non bloccare la risposta HTTP, ma chiama subito SDK
+        threading.Thread(target=command_executor.run, args=(command, argument), daemon=True).start()
+        return jsonify({"success": True, "message": "EMERGENZA INVIATA AL DRONE!"})
+
+    enqueued = enqueue_executor_commands([(command, argument)], source="web")
+    if enqueued > 0:
+        return jsonify({"success": True, "message": "Comando accodato con successo."})
+    else:
+        return jsonify({"success": False, "message": "Comando ignorato (duplicato o coda piena)."})
 
 
 @app.route("/api/commands", methods=["GET"])
@@ -1019,12 +1067,9 @@ def send_message():
     )
 
     # Parsing comando e argomento opzionale
-    match = re.match(r"^(.*?)(?:\s+(-?\d+))?$", message_trimmed)
-    if match:
-        direct_command = match.group(1).strip()
-        direct_arg_raw = match.group(2)
-        direct_argument = int(direct_arg_raw) if direct_arg_raw is not None else None
-
+    direct_command, direct_argument = parse_direct_command(message_trimmed)
+    
+    if direct_command:
         ok_direct, msg_direct, canonical_direct, effective_direct_arg = command_executor.validate(
             direct_command,
             direct_argument,
@@ -1136,6 +1181,7 @@ def get_status():
         return jsonify({
             "wifi_connected": app_state["wifi_connected"],
             "stream_active":  app_state["stream_active"],
+            "allow_parser_takeoff": app_state.get("allow_parser_takeoff", False),
             "battery":        app_state["battery"],
             "rc_speed":       DRONE_RC_SPEED,
         })
@@ -1381,12 +1427,14 @@ def get_config():
         "CONTRAST_BETA": "Offset contrasto immagine (default: 2)",
         "OCR_ENABLED": "Abilita invio frame a server OCR remoto",
         "FUNCTIONGEMMA_ENABLED": "Abilita interpretazione comandi chat con FunctionGemma (se false, comandi esatti)",
-        "COMMAND_DEDUP_WINDOW_SECONDS": "Finestra anti-duplicato per lo stesso comando eseguito (secondi, 0 = disabilitato)",
+        "COMMAND_DEDUP_WINDOW_SECONDS": "Finestra anti-duplicato per gli stessi comandi OCR eseguiti (secondi, 0 = disabilitato)",
         "CHAT_MESSAGE_DEDUP_WINDOW_SECONDS": "Finestra anti-duplicato per messaggi chat identici consecutivi (secondi, 0 = disabilitato)",
         "OCR_SERVER_URL": "URL base del server RestOCR (es. https://ocr.sitai.duckdns.org)",
         "OCR_TIMEOUT": "Timeout richiesta OCR in secondi (default: 30)",
         "OCR_INTERVAL_SECONDS": "Intervallo minimo tra invii OCR in secondi (min: 1.0)",
         "OCR_JPEG_QUALITY": "Qualità JPEG per frame inviati a OCR (0-100)",
+        "VOICE_SILENCE_TIMEOUT": "Timeout di silenzio in secondi prima di inviare la trascrizione finale (es. 0.9)",
+        "VOICE_MIN_INPUT_RMS": "Soglia RMS minima per considerare input vocale (es. 0.02)",
         "OLLAMA_URL": "Indirizzo del server Ollama (es. http://192.168.103.53:11434)",
         "OLLAMA_MODEL": "Nome del modello Ollama principale",
         "OLLAMA_FUNCTIONGEMMA_MODEL": "Nome del modello FunctionGemma in Ollama",

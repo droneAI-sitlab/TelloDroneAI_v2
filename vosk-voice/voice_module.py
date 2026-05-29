@@ -153,7 +153,7 @@ def init_voice_module(
     # Carica .env se presente (utile anche in uso standalone del modulo)
     load_dotenv(override=False)
 
-    env_min_final_chars = _env_int("VOICE_MIN_FINAL_CHARS", 4)
+    env_min_final_chars = _env_int("VOICE_MIN_FINAL_CHARS", 1)
     env_min_avg_confidence = _env_float("VOICE_MIN_AVG_CONFIDENCE", 0.7)
     env_dedupe_window = _env_float("VOICE_DEDUPE_WINDOW_SECONDS", 2.0)
     
@@ -214,12 +214,56 @@ def _voice_websocket_handler(ws):
             audio_data = ws.receive()
             if audio_data is None:
                 break
-            
-            # Ignora messaggi di testo (es. ping/pong)
+
+            # Se riceviamo una stringa JSON di controllo, gestiscila (es. flush)
             if isinstance(audio_data, str):
+                try:
+                    ctrl = json.loads(audio_data)
+                except Exception:
+                    # Non-JSON: ignora (ping/pong o altri messaggi)
+                    continue
+
+                if isinstance(ctrl, dict) and ctrl.get("cmd") == "flush":
+                    # Forza un risultato finale anche se AcceptWaveform non ha
+                    # ancora segnato endpoint: utile quando il client rileva
+                    # silenzio e vuole che la trascrizione venga emessa.
+                    try:
+                        result = json.loads(rec.FinalResult())
+                    except Exception as e:
+                        print(f"[VoiceModule] Errore FinalResult: {e}")
+                        continue
+
+                    text = result.get('text', '').strip()
+                    if text:
+                        accepted, payload_or_reason, avg_conf = _filter_final_text(text, result, session_id)
+                        if not accepted:
+                            print(
+                                f"[VoiceModule] Sessione {session_id} - FINALE (flush) scartato: "
+                                f"{payload_or_reason} | testo='{text}'"
+                            )
+                        else:
+                            text = payload_or_reason
+                            print(
+                                f"[VoiceModule] Sessione {session_id} - FINALE (flush): {text} "
+                                f"(conf={avg_conf:.2f})"
+                            )
+                            if _on_transcription_callback:
+                                try:
+                                    _on_transcription_callback(text, session_id)
+                                except Exception as e:
+                                    print(f"[VoiceModule] Errore callback: {e}")
+
+                            ws.send(json.dumps({
+                                "text": text,
+                                "is_final": True,
+                                "session_id": session_id,
+                                "avg_confidence": avg_conf
+                            }))
+
+                # Ignora altri comandi/testi
                 continue
-            
-            # Processa l'audio
+
+            # Processa l'audio binario
             if rec.AcceptWaveform(audio_data):
                 # Risultato finale
                 result = json.loads(rec.Result())
@@ -238,14 +282,14 @@ def _voice_websocket_handler(ws):
                         f"[VoiceModule] Sessione {session_id} - FINALE: {text} "
                         f"(conf={avg_conf:.2f})"
                     )
-                    
+
                     # Esegui callback se definito
                     if _on_transcription_callback:
                         try:
                             _on_transcription_callback(text, session_id)
                         except Exception as e:
                             print(f"[VoiceModule] Errore callback: {e}")
-                    
+
                     # Invia risposta al client
                     ws.send(json.dumps({
                         "text": text,
@@ -264,7 +308,7 @@ def _voice_websocket_handler(ws):
                             _on_partial_callback(text, session_id)
                         except Exception as e:
                             print(f"[VoiceModule] Errore callback parziale: {e}")
-                    
+
                     ws.send(json.dumps({
                         "text": text,
                         "is_final": False,

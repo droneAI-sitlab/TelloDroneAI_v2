@@ -57,6 +57,9 @@ def _get_wifi_interface() -> str | None:
         None - nessun adattatore trovato o errore
     """
     try:
+        # Tentativo preventivo di accendere il Wi-Fi se disattivato
+        _try_enable_wifi_adapter()
+
         result = _run(["netsh", "wlan", "show", "interfaces"])
         for line in result.stdout.splitlines():
             # La prima riga con rientro (4+ spazi) e ':' e' sempre il nome
@@ -67,6 +70,33 @@ def _get_wifi_interface() -> str | None:
     except Exception as exc:
         print(f"[wifi] Errore _get_wifi_interface: {exc}")
     return None
+
+def _try_enable_wifi_adapter():
+    """
+    Tenta di abilitare l'adattatore Wi-Fi nel caso fosse disabilitato.
+    Questo copre i casi in cui l'utente ha l'interfaccia spenta.
+    Richiede privilegi amministrativi per funzionare (se e' disabilitata da devmgmt),
+    ma se e' un semplice problema di radio non guasta provare.
+    """
+    try:
+        result = _run(["netsh", "interface", "show", "interface"])
+        for line in result.stdout.splitlines():
+            # Cerchiamo un'interfaccia che contiene "Wi-Fi" (case-insensitive)
+            if "wi-fi" in line.lower():
+                parts = line.split()
+                # Lo stato admin e' la prima colonna (es. "Abilitato" o "Disabilitato")
+                # ma essendo language-dependent cerchiamo solo di inviare il comando
+                # di enable sull'interfaccia trovata se sembra spenta.
+                # Per semplicita', estraiamo il nome dell'interfaccia (ultima parte dopo i campi fissi)
+                # Un approccio piu robusto e' prendere tutto il testo dalla colonna "Dedicato" in poi,
+                # ma siccome `netsh interface show interface` ha colonne a larghezza fissa, 
+                # e' meglio parsare genericamente l'ultima porzione o provare sul nome standard "Wi-Fi".
+                pass
+        
+        # Facciamo un tentativo generico col nome "Wi-Fi"
+        _run(["netsh", "interface", "set", "interface", "Wi-Fi", "admin=enable"], timeout=3)
+    except:
+        pass
 
 
 def _ensure_open_profile(ssid: str) -> bool:
