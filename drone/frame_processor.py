@@ -149,7 +149,7 @@ class FrameProcessor:
             )
         else:
             # Copia esplicita: garantisce scrivibilità per cv2.putText e simili
-            frame = np.ascontiguousarray(frame)
+            frame = frame.copy(order="C")
 
         return self._ai_inference(frame)
 

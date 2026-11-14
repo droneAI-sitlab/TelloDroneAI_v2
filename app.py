@@ -21,7 +21,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 from flask import Flask, Response, jsonify, render_template, request
-from dotenv import load_dotenv
+from dotenv import load_dotenv, dotenv_values, set_key
+import tempfile
+import math
 
 # ── Carica voice_module dalla cartella "vosk-voice" ───────────────────
 _VOICE_MODULE_FILE = os.path.join(os.path.dirname(__file__), "vosk-voice", "voice_module.py")
@@ -52,12 +54,21 @@ from drone.chat_parser import parse_direct_command
 # ── Load environment variables from .env ──────────────────────────────
 # override=True evita che vecchie variabili di ambiente del processo
 # mantengano valori stale (es. FUNCTIONGEMMA_ENABLED=false).
-load_dotenv(override=True)
+load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
 app = Flask(__name__)
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 app.register_blueprint(voice_bp, url_prefix="/voice")
+app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024
+
+
+@app.before_request
+def validate_json_body():
+    if request.path.startswith("/api/") and request.method in {"POST", "PUT", "PATCH"}:
+        if request.get_data() and not isinstance(request.get_json(silent=True), dict):
+            return jsonify(success=False, message="Il corpo deve essere un oggetto JSON"), 400
+
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -95,9 +106,9 @@ def _env_float(name: str, default: float) -> float:
 
 app.secret_key = os.getenv("SECRET_KEY", "dev-secret-key-change-in-prod")
 
-FLASK_HOST  = os.getenv("FLASK_HOST", "0.0.0.0")
+FLASK_HOST  = os.getenv("FLASK_HOST", "127.0.0.1")
 FLASK_PORT  = int(os.getenv("FLASK_PORT", 5000))
-FLASK_DEBUG = _env_bool("FLASK_DEBUG", True)
+FLASK_DEBUG = _env_bool("FLASK_DEBUG", False)
 
 DRONE_IP    = os.getenv("DRONE_IP",    "192.168.10.1")
 DRONE_PORT  = int(os.getenv("DRONE_PORT",  8889))
@@ -201,7 +212,7 @@ def echo_functiongemma_terminal(title: str, payload: dict | None = None) -> None
 ########################################################################
 
 # DroneReader incapsula djitellopy; una sola istanza per tutta la vita dell'app
-drone_reader = DroneReader(host=DRONE_IP, video_port=VIDEO_PORT)
+drone_reader = DroneReader(host=DRONE_IP, video_port=VIDEO_PORT, command_port=DRONE_PORT)
 
 # FrameProcessor gestisce resize, contrasto e hook AI per ogni frame
 frame_processor = FrameProcessor(
@@ -306,7 +317,7 @@ def _reload_runtime_config(changed_keys: set[str] | None = None) -> tuple[list[s
     Returns:
         (applied_keys, restart_required_keys)
     """
-    load_dotenv(override=True)
+    load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
     global LOG_MAX_ENTRIES
     global DRONE_WIFI_SSID, WIFI_TIMEOUT
@@ -503,8 +514,20 @@ def enqueue_executor_commands(commands: list[tuple[str, int | None]], source: st
     batch_seen: set[tuple[str, int | None]] = set()
 
     for command_name, argument in commands:
-        normalized = _normalize_command_key(command_name)
-        
+        valid, error, command_name, argument = command_executor.validate(command_name, argument)
+        if not valid:
+            add_log(error, "warning")
+            continue
+        normalized = command_name
+        if normalized == "emergency":
+            _drain_command_buffer()
+            threading.Thread(
+                target=command_executor.run, args=(command_name, argument),
+                kwargs={"source": source}, daemon=True,
+            ).start()
+            # Discard the remainder of this batch after an emergency stop.
+            return enqueued + 1
+
         # Se il lock decollo e' abilitato (True), rifiuta i comandi di decollo derivati da chat, ocr, mic, ecc.
         if normalized == "takeoff" and source != "web":
             with _state_lock:
@@ -576,7 +599,10 @@ def _command_buffer_worker() -> None:
         
         if has_real_commands:
             # Estrai ed esegui comando dalla coda
-            _, _, command_name, argument, source = command_buffer.get()
+            try:
+                _, _, command_name, argument, source = command_buffer.get_nowait()
+            except queue.Empty:
+                continue
             try:
                 ok_cmd, msg_cmd = command_executor.run(command_name, argument, source=source)
                 if ok_cmd:
@@ -593,8 +619,8 @@ def _command_buffer_worker() -> None:
             
             # Reset del timer keepalive quando eseguiamo un comando reale
             with _keepalive_lock:
-                _last_keepalive_ts = 0.0
-            
+                _last_keepalive_ts = time.monotonic()
+
             # Delay tra comandi
             if COMMAND_BUFFER_DELAY_SECONDS > 0:
                 waited = 0.0
@@ -653,8 +679,8 @@ def _command_buffer_worker() -> None:
                     with _keepalive_lock:
                         _last_keepalive_ts = time.monotonic()
                 
-                # Attendi il resto del cooldown prima di ricontrollare
-                time.sleep(max(0.0, KEEPALIVE_COOLDOWN_SECONDS - 0.1))
+                # Ricontrolla presto la coda; il timestamp gestisce il cooldown.
+                time.sleep(0.05)
             else:
                 # In cooldown, aspetta un po'
                 time.sleep(0.1)
@@ -910,7 +936,7 @@ def rc_control():
         fb = max(-100, min(100, int(data.get("fb", 0))))
         ud = max(-100, min(100, int(data.get("ud", 0))))
         yaw = max(-100, min(100, int(data.get("yaw", 0))))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return jsonify({"success": False, "message": "Parametri RC non validi"}), 400
 
     try:
@@ -938,17 +964,16 @@ def execute_command():
     if not command:
         return jsonify({"success": False, "message": "Campo 'command' mancante"})
 
-    if argument is not None:
-        try:
-            argument = int(argument)
-        except (ValueError, TypeError):
-            return jsonify({"success": False, "message": "'argument' deve essere un intero"})
+    valid, error, command, argument = command_executor.validate(command, argument)
+    if not valid:
+        return jsonify(success=False, message=error), 400
 
     add_log(f"Comando: {command}" + (f" {argument}" if argument is not None else ""), "user")
     
     # L'emergenza DEVE interrompere subito ignorando la coda e i blocchi del thread worker.
     if _normalize_command_key(command) == "emergency":
         # Avvia in un thread separato per non bloccare la risposta HTTP, ma chiama subito SDK
+        _drain_command_buffer()
         threading.Thread(target=command_executor.run, args=(command, argument), daemon=True).start()
         return jsonify({"success": True, "message": "EMERGENZA INVIATA AL DRONE!"})
 
@@ -1261,7 +1286,6 @@ def _frame_generator():
     Calcolo FPS basato SOLO sui frame effettivamente inviati al client.
     """
     last_sent = time.perf_counter()
-    last_ocr_result_id = 0
     frames_sent = 0
     last_fps_update = time.perf_counter()
     no_frame_since = 0.0
@@ -1302,9 +1326,8 @@ def _frame_generator():
                 ocr_sender.send_frame(frame)
 
                 # Invia a Ollama solo quando arriva un nuovo risultato OCR.
-                current_result_id = ocr_sender.get_last_result_id()
-                if current_result_id > last_ocr_result_id:
-                    ocr_words = ocr_sender.get_last_words()
+                ocr_words = ocr_sender.consume_words()
+                if ocr_words:
                     
                     def process_ollama(words):
                         ok_llm, llm_output, ocr_input = call_ollama_from_ocr_words(words)
@@ -1327,7 +1350,6 @@ def _frame_generator():
                                 add_log(f"Errore chiamata Ollama da OCR: {llm_output}", "error")
 
                     threading.Thread(target=process_ollama, args=(ocr_words,), daemon=True).start()
-                    last_ocr_result_id = current_result_id
 
             # ── Regolazione timing prima di encode/yield ─────────────────────
             min_interval = 1.0 / max(1.0, TARGET_FPS)
@@ -1448,30 +1470,35 @@ def get_config():
         "MEDIA_VIDEO_CODEC": "Codec FourCC video (default: mp4v)",
     }
     
-    config = {}
-    env_file_path = ".env"
+    env_file_path = Path(__file__).resolve().parent / ".env"
     
-    # Read .env file and parse it
-    if os.path.exists(env_file_path):
-        with open(env_file_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                # Skip empty lines and comments
-                if not line or line.startswith('#'):
-                    continue
-                # Parse KEY=VALUE
-                if '=' in line:
-                    key, value = line.split('=', 1)
-                    key_clean = key.strip()
-                    
-                    # Only include non-excluded variables
-                    if key_clean not in EXCLUDED_VARS:
-                        config[key_clean] = value.strip()
-    
+    config = {
+        key: value for key, value in dotenv_values(env_file_path).items()
+        if key not in EXCLUDED_VARS
+    }
+
     return jsonify({
         "config": config,
         "descriptions": DESCRIPTIONS
     })
+
+
+_config_lock = threading.Lock()
+_NUMERIC_CONFIG = {
+    **{k: (1, 65535, True) for k in ("FLASK_PORT", "DRONE_PORT", "VIDEO_PORT")},
+    **{k: (1, 8192, True) for k in ("FRAME_WIDTH", "FRAME_HEIGHT")},
+    **{k: (0, 100, True) for k in ("JPEG_QUALITY", "OCR_JPEG_QUALITY", "DRONE_RC_SPEED")},
+    **{k: (0.01, 3600, False) for k in ("TARGET_FPS", "MEDIA_VIDEO_FPS", "OCR_INTERVAL_SECONDS", "KEEPALIVE_COOLDOWN_SECONDS")},
+    **{k: (1, 3600, True) for k in ("OCR_TIMEOUT", "OLLAMA_TIMEOUT", "WIFI_CONNECT_TIMEOUT")},
+    **{k: (0, 3600, False) for k in ("COMMAND_BUFFER_DELAY_SECONDS", "COMMAND_DEDUP_WINDOW_SECONDS", "CHAT_MESSAGE_DEDUP_WINDOW_SECONDS")},
+    "COMMAND_BUFFER_MAX_SIZE": (1, 10000, True),
+    "LOG_MAX_ENTRIES": (1, 10000, True),
+    "OCR_MIN_CONFIDENCE": (0, 1, False),
+    "DRONE_SPEED": (10, 100, True),
+    "CONTRAST_ALPHA": (0, 100, False),
+    "CONTRAST_BETA": (-255, 255, True),
+    "OLLAMA_TEMPERATURE": (0, 2, False),
+}
 
 
 @app.route("/api/config", methods=["POST"])
@@ -1487,52 +1514,44 @@ def save_config():
     if not isinstance(new_config, dict):
         return jsonify({"success": False, "message": "Campo 'config' deve essere un dizionario"})
     
-    env_file_path = ".env"
+    env_file_path = Path(__file__).resolve().parent / ".env"
     
     try:
-        # Read existing .env file to preserve comments and order
-        lines = []
-        if os.path.exists(env_file_path):
-            with open(env_file_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-        
-        # Create a new content preserving comments and structure
-        new_lines = []
-        processed_keys = set()
-        changed_keys: set[str] = set()
-        
-        for line in lines:
-            stripped = line.strip()
-            
-            # Keep blank lines and comments as-is
-            if not stripped or stripped.startswith('#'):
-                new_lines.append(line)
-            elif '=' in stripped:
-                key = stripped.split('=', 1)[0].strip()
-                if key in new_config:
-                    # Replace with new value
-                    incoming = str(new_config[key]).strip()
-                    old_value = stripped.split('=', 1)[1].strip()
-                    new_lines.append(f"{key}={incoming}\n")
-                    processed_keys.add(key)
-                    if incoming != old_value:
-                        changed_keys.add(key)
-                else:
-                    # Keep existing line
-                    new_lines.append(line)
-        
-        # Add any new keys that were not in the original file
         for key, value in new_config.items():
-            if key not in processed_keys:
-                incoming = str(value).strip()
-                new_lines.append(f"{key}={incoming}\n")
-                changed_keys.add(key)
-        
-        # Write back to .env
-        with open(env_file_path, 'w', encoding='utf-8') as f:
-            f.writelines(new_lines)
+            if not re.fullmatch(r"[A-Z][A-Z0-9_]*", key):
+                return jsonify(success=False, message="Nome configurazione non valido"), 400
+            if not isinstance(value, (str, int, float, bool)) or any(c in str(value) for c in "\r\n\x00"):
+                return jsonify(success=False, message=f"Valore non valido: {key}"), 400
+            if key in _NUMERIC_CONFIG:
+                minimum, maximum, integer = _NUMERIC_CONFIG[key]
+                try:
+                    if isinstance(value, bool):
+                        raise ValueError()
+                    number = float(value)
+                    if not math.isfinite(number) or not minimum <= number <= maximum or (integer and not number.is_integer()):
+                        raise ValueError()
+                    if integer:
+                        new_config[key] = str(int(number))
+                except (ValueError, TypeError, OverflowError):
+                    return jsonify(success=False, message=f"Valore numerico non valido: {key}"), 400
+            if key == "MEDIA_VIDEO_CODEC" and len(str(value)) != 4:
+                return jsonify(success=False, message="Il codec deve avere 4 caratteri"), 400
 
-        applied_keys, restart_required = _reload_runtime_config(changed_keys)
+        with _config_lock:
+            existing = dotenv_values(env_file_path)
+            changed_keys = {key for key, value in new_config.items() if str(value) != existing.get(key)}
+            fd, temporary = tempfile.mkstemp(dir=env_file_path.parent, prefix=".env-")
+            os.close(fd)
+            try:
+                Path(temporary).write_text(env_file_path.read_text() if env_file_path.exists() else "", encoding="utf-8")
+                for key, value in new_config.items():
+                    set_key(temporary, key, str(value), quote_mode="always")
+                os.replace(temporary, env_file_path)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+
+            applied_keys, restart_required = _reload_runtime_config(changed_keys)
 
         restart_msg = ""
         if restart_required:
@@ -1712,5 +1731,6 @@ if __name__ == "__main__":
         port=FLASK_PORT,
         debug=FLASK_DEBUG,
         threaded=True,
-        ssl_context='adhoc'
+        ssl_context='adhoc',
+        use_reloader=False
     )

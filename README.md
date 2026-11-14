@@ -93,11 +93,44 @@ TelloDroneAI_v2/
 
 ## Come avviare
 
-```bash
-# Attiva il virtualenv
-.\venv\Scripts\python.exe app.py
+Richiede Python 3.11 o successivo. Il controllo automatico della rete WiFi usa
+`netsh` ed è supportato solo su Windows: su macOS/Linux si possono eseguire
+interfaccia e test offline, ma il flusso WiFi/volo richiede un adattamento.
 
-# oppure, se la policy PowerShell lo consente
-.\venv\Scripts\Activate.ps1
+```bash
+python -m venv .venv
+# Windows PowerShell:
+.venv\Scripts\Activate.ps1
+# macOS/Linux:
+source .venv/bin/activate
+
+python -m pip install -r requirements.txt
+# Copia .env.example in .env e imposta almeno DRONE_WIFI_SSID.
 python app.py
 ```
+
+Apri `https://127.0.0.1:5000`. Il certificato locale è autofirmato; il browser
+richiede di accettarlo per usare dashboard e microfono. Di default il server
+ascolta solo su localhost, con debugger e reloader disattivati. Per accesso
+LAN imposta esplicitamente `FLASK_HOST`; le API non hanno autenticazione.
+Il processo deve essere unico perché mantiene una sola connessione al drone.
+
+Su macOS viene installato Vosk 0.3.44, disponibile come wheel universale;
+sulle altre piattaforme resta fissata la versione 0.3.45.
+
+## Verifiche senza hardware
+
+```bash
+python -m unittest discover -v
+python -m pip check
+node --check static/js/main.js
+```
+
+I test usano mock per drone, rete e modello vocale e coprono validazione API,
+limiti dei comandi, emergenze, parsing, OCR, configurazione e ciclo di vita media.
+Non avviano il drone. Volo, latenza dei comandi, WiFi Windows, riconoscimento
+vocale reale e integrazione con OCR/Ollama vanno verificati nell'ambiente finale.
+
+Un'emergenza scarta i comandi in attesa e il resto del relativo batch; un comando
+SDK già in esecuzione non può essere annullato dal worker Python. Il comando
+emergency arresta immediatamente i motori e non equivale a un atterraggio.

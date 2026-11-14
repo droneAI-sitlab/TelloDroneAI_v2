@@ -63,6 +63,10 @@ COMMAND_PRIORITY_KEEPALIVE: int = 2
 
 
 _FUNCTIONS_MAP = {
+    "get_battery": lambda t, _: t.get_battery(),
+    "take_photo": None,
+    "start_video_recording": None,
+    "stop_video_recording": None,
     "takeoff": lambda t, _: t.takeoff(),
     "land": lambda t, _: t.land(),
     "emergency": lambda t, _: t.emergency(),
@@ -475,8 +479,8 @@ class CommandExecutor:
             print(f"[command_executor] {msg}")
             return False, msg
 
-        arg_match = re.search(r"\b(\d{1,3})\b", cleaned)
-        parsed_argument = int(arg_match.group(1)) if arg_match else None
+        arg_match = re.search(r"(?<![\w.])(-?\d+(?:\.\d+)?)(?![\w.])", cleaned)
+        parsed_argument = arg_match.group(1) if arg_match else None
 
         print(
             f"[command_executor] OCR match -> comando={best_match} "
@@ -558,6 +562,8 @@ class CommandExecutor:
         Returns:
             Nome canonico oppure None se non trovato
         """
+        if not isinstance(command, str):
+            return None
         normalized = re.sub(r"[\s\-]+", "_", command.strip().lower())
 
         if normalized in COMMAND_TABLE:
@@ -589,7 +595,13 @@ class CommandExecutor:
             return None
 
         # Usa il valore fornito oppure il default
-        value = int(argument) if argument is not None else default
+        raw = argument if argument is not None else default
+        if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+            return f"Argomento non intero per '{canonical}'"
+        try:
+            value = int(raw)
+        except (ValueError, TypeError, OverflowError):
+            return f"Argomento non intero per '{canonical}'"
 
         # Applica i limiti SDK in base al tipo di comando
         if entry["unit"] == "cm":

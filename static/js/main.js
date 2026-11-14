@@ -617,6 +617,16 @@ document.addEventListener("keyup", (event) => {
 
 
 // ================================================================
+// Release held controls when keyup cannot reach this page.
+function releaseKeyboardControls() {
+    activeKeys = {};
+    if (ui.keyboardMode) sendRCControl(0, 0, 0, 0);
+}
+window.addEventListener("blur", releaseKeyboardControls);
+document.addEventListener("visibilitychange", () => {
+    if (document.hidden) releaseKeyboardControls();
+});
+
 //  MESSAGING  –  text commands from the input field
 // ================================================================
 

@@ -19,6 +19,7 @@ import platform
 import subprocess
 import tempfile
 import time
+from xml.sax.saxutils import escape
 
 
 ########################################################################
@@ -114,6 +115,7 @@ def _ensure_open_profile(ssid: str) -> bool:
     Returns:
         True se il profilo e stato aggiunto con successo
     """
+    ssid = escape(ssid)
     # Template XML per rete aperta (authEncryption: open/none)
     profile_xml = (
         '<?xml version="1.0"?>\n'
@@ -247,7 +249,8 @@ def connect(ssid: str, timeout: int = 15) -> bool:
         print(f"[wifi] Adattatore WiFi: '{interface}'")
 
     # -- 3. Installa profilo per rete aperta (Tello) -------------------
-    _ensure_open_profile(ssid)
+    if not _ensure_open_profile(ssid):
+        return False
 
     try:
         # -- 4. Disconnetti dalla rete corrente ------------------------
