@@ -26,7 +26,8 @@ srt==3.5.3
 tqdm==4.67.3
 typing_extensions==4.15.0
 urllib3==2.6.3
-vosk==0.3.45
+vosk==0.3.45; sys_platform != "darwin"
+vosk==0.3.44; sys_platform == "darwin"
 websockets==16.0
 Werkzeug==3.1.6
 wsproto==1.3.2

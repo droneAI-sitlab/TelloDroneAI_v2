@@ -26,6 +26,7 @@
 """
 
 import os
+import math
 import time
 import threading
 import queue
@@ -101,6 +102,7 @@ class OCRSender:
         # ── Ultime parole OCR pulite (senza confidenza) + id risultato ──
         self.last_words: list = []
         self.last_result_id: int = 0
+        self._consumed_result_id = 0
         
         # ── Coda per thread worker (1 frame max alla volta) ───────────────
         self._frame_queue = queue.Queue(maxsize=1)
@@ -193,9 +195,13 @@ class OCRSender:
             # Svuota prima la coda per evitare frame stantii
             while not self._frame_queue.empty():
                 self._frame_queue.get_nowait()
+                self._frame_queue.task_done()
         except queue.Empty:
             pass
-        self._frame_queue.put(frame_copy)
+        try:
+            self._frame_queue.put_nowait(frame_copy)
+        except queue.Full:
+            pass
 
     def _worker_loop(self) -> None:
         """
@@ -205,7 +211,10 @@ class OCRSender:
         while True:
             try:
                 frame = self._frame_queue.get()
-                self._process_and_send(frame)
+                try:
+                    self._process_and_send(frame)
+                finally:
+                    self._frame_queue.task_done()
             except Exception as e:
                 print(f"[ocr_sender] Errore worker thread: {e}")
 
@@ -249,6 +258,14 @@ class OCRSender:
     # ----------------------------------------------------------------
     #  API LETTURA RISULTATI
     # ----------------------------------------------------------------
+
+    def consume_words(self) -> list:
+        """Prende un risultato una sola volta, anche con più viewer MJPEG."""
+        with self._lock:
+            if self.last_result_id <= self._consumed_result_id:
+                return []
+            self._consumed_result_id = self.last_result_id
+            return list(self.last_words)
 
     def get_last_results(self) -> list:
         """
@@ -347,15 +364,20 @@ class OCRSender:
             Lista di dict OCR validi e ordinati per confidenza decrescente
         """
         # Filtra per soglia minima e scarta entry malformate
-        filtered = [
-            item for item in raw_results
-            if isinstance(item, dict)
-            and item.get("confidence", 0.0) >= self._min_conf
-            and "text" in item
-        ]
-
-        # Ordina per confidenza decrescente (testi più affidabili prima)
-        filtered.sort(key=lambda x: x.get("confidence", 0.0), reverse=True)
+        filtered = []
+        if not isinstance(raw_results, list):
+            return filtered
+        for item in raw_results:
+            if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+                continue
+            try:
+                confidence = float(item.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(confidence) and self._min_conf <= confidence <= 1.0:
+                filtered.append({**item, "confidence": confidence})
+        # Preserva l'ordine di lettura del server: riordinare per confidenza
+        # cambia il significato e l'ordine dei comandi riconosciuti.
 
         return filtered
 

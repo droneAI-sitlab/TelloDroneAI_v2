@@ -134,12 +134,7 @@ def parse_function_calls(model_output: str) -> list[dict]:
     call_pattern = r'call:(?P<name>\w+)\{(?P<args>.*?)\}'
     kv_pattern = r'(?P<key>\w+)\s*:\s*(?P<val>[^,}]+)'
 
-    for part in model_output.split('<start_function_call>'):
-        if not part.strip():
-            continue
-        match = re.search(call_pattern, part)
-        if not match:
-            continue
+    for match in re.finditer(call_pattern, model_output, re.DOTALL):
 
         func_name = match.group("name")
         args_str = match.group("args").strip()
@@ -271,11 +266,13 @@ def parse_model_output_to_executor_commands(model_output: str) -> list[tuple[str
                 argument = next(iter(args.values()))
 
         if argument is not None:
+            if isinstance(argument, bool) or not isinstance(argument, (int, str)):
+                continue
             try:
                 argument = int(argument)
-            except (TypeError, ValueError):
-                # Lasciare come None evita errori su comandi senza parametri validi.
-                argument = None
+            except (TypeError, ValueError, OverflowError):
+                # Un argomento malformato non deve diventare un movimento di default.
+                continue
 
         commands.append((canonical_name, argument))
 

@@ -50,7 +50,7 @@ class DroneReader:
     djitellopy usa internamente un thread per aggiornare il frame.
     """
 
-    def __init__(self, host: str, video_port: int) -> None:
+    def __init__(self, host: str, video_port: int, command_port: int = 8889) -> None:
         """
         Args:
             host:       IP del drone (default Tello: 192.168.10.1)
@@ -58,6 +58,7 @@ class DroneReader:
         """
         self._host       = host
         self._video_port = video_port
+        self._command_port = command_port
         self._tello: Optional[Tello] = None
         self._frame_read: Optional[BackgroundFrameRead] = None
 
@@ -81,8 +82,11 @@ class DroneReader:
         self.cleanup_connection()
         try:
             self._tello = Tello(host=self._host)
+            self._tello.address = (self._host, self._command_port)
             self._tello.RESPONSE_TIMEOUT = _DRONE_RESPONSE_TIMEOUT
             self._tello.connect()
+            if self._video_port != self._tello.vs_udp_port:
+                self._tello.change_vs_udp(self._video_port)
             print("[frame_reader] Connesso al drone (solo comandi)")
             return True
         except Exception as exc:
@@ -148,18 +152,19 @@ class DroneReader:
         """
         with self._lock:
             ready = self._stream_ready
+            frame_read = self._frame_read
 
-        if not ready or self._frame_read is None:
+        if not ready or frame_read is None:
             return None
 
-        frame = self._frame_read.frame
+        frame = frame_read.frame
 
         # Filtra frame vuoti o non inizializzati
         if frame is None or frame.size == 0:
             return None
 
-        # Conversione BGR → RGB (djitellopy restituisce BGR)
-        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # Il decoder PyAV di djitellopy restituisce RGB; OpenCV usa BGR.
+        return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
     # ----------------------------------------------------------------
     #  STOP STREAM
@@ -179,6 +184,8 @@ class DroneReader:
             except Exception:
                 pass
             self._frame_read = None
+            if self._tello is not None:
+                self._tello.background_frame_read = None
 
         if self._tello is not None:
             try:

@@ -89,6 +89,7 @@ class DroneMediaCapture:
             if not writer.isOpened():
                 raise RuntimeError("Impossibile aprire il file video per la registrazione")
 
+            self._recording_size = (width, height)
             self._video_writer = writer
             self._recording_path = file_path
             self._stop_event.clear()
@@ -117,10 +118,11 @@ class DroneMediaCapture:
         if thread is not None:
             thread.join(timeout=3.0)
 
+        if thread is not None and thread.is_alive():
+            raise RuntimeError("Registrazione ancora in arresto: riprovare")
+
         with self._lock:
-            self._release_writer_locked()
             self._recording_thread = None
-            self._stop_event.clear()
             if current_path is None:
                 raise RuntimeError("Registrazione terminata ma path non disponibile")
             return current_path
@@ -144,34 +146,32 @@ class DroneMediaCapture:
         """Thread loop: legge frame dal drone e li scrive nel file video."""
         frame_interval = 1.0 / max(1.0, self._video_fps)
 
-        while not self._stop_event.is_set():
-            frame = self._reader.get_frame()
-            if frame is None:
-                time.sleep(0.01)
-                continue
-
-            processed_frame = self._processor.process_to_frame(frame)
-            if processed_frame is None:
-                time.sleep(0.01)
-                continue
-
+        try:
+            while not self._stop_event.is_set():
+                frame = self._reader.get_frame()
+                if frame is None:
+                    self._stop_event.wait(0.01)
+                    continue
+                processed_frame = self._processor.process_to_frame(frame)
+                if processed_frame is None:
+                    self._stop_event.wait(0.01)
+                    continue
+                with self._lock:
+                    writer = self._video_writer
+                    if writer is None:
+                        break
+                    processed_frame = cv2.resize(processed_frame, self._recording_size)
+                    writer.write(processed_frame)
+                self._stop_event.wait(frame_interval)
+        finally:
             with self._lock:
-                writer = self._video_writer
-
-            if writer is None:
-                break
-
-            writer.write(processed_frame)
-            time.sleep(frame_interval)
-
-        with self._lock:
-            self._release_writer_locked()
+                self._release_writer_locked()
 
     def _ensure_output_dir(self) -> None:
         os.makedirs(self._output_dir, exist_ok=True)
 
     def _build_output_path(self, prefix: str, extension: str) -> str:
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         file_name = f"{prefix}_{timestamp}.{extension}"
         return os.path.join(self._output_dir, file_name)
 

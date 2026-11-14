@@ -106,5 +106,29 @@
     "unit": "",
     "default": null,
     "aliases": ["keepalive_no_response", "keepalive_nr"]
+  },
+  "get_battery": {
+    "desc": "Leggi batteria",
+    "unit": "%",
+    "default": null,
+    "aliases": []
+  },
+  "take_photo": {
+    "desc": "Scatta foto",
+    "unit": "",
+    "default": null,
+    "aliases": []
+  },
+  "start_video_recording": {
+    "desc": "Avvia registrazione",
+    "unit": "",
+    "default": null,
+    "aliases": []
+  },
+  "stop_video_recording": {
+    "desc": "Ferma registrazione",
+    "unit": "",
+    "default": null,
+    "aliases": []
   }
 }
